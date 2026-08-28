@@ -1753,6 +1753,7 @@ def process_unseen(server, state):
     fetched = server.fetch(uids, ["RFC822", "INTERNALDATE"])
     flagged = []
     dirty = False
+    retry = set()      # UIDs deliberately left for a later pass
 
     for uid in uids:
         # A failure on one message must never take down the connection or
@@ -1904,6 +1905,7 @@ def process_unseen(server, state):
             if limited:
                 log.warning("holding reply to %s - %s; will retry later", sender, limited)
                 state["seen_ids"].remove(msg_id)
+                retry.add(uid)
                 continue
 
             if files_refused:
@@ -1929,6 +1931,7 @@ def process_unseen(server, state):
                 except Exception as exc:
                     log.error("decline notice failed for %s: %s", sender, exc)
                     state["seen_ids"].remove(msg_id)
+                    retry.add(uid)
                     continue
                 record_send(state)
                 flagged.append({
@@ -1987,6 +1990,7 @@ def process_unseen(server, state):
 
             if reply is None:                       # API failure - retry next time
                 state["seen_ids"].remove(msg_id)
+                retry.add(uid)
                 log.warning("no reply generated for %s - will retry", sender)
                 continue
 
@@ -2009,6 +2013,7 @@ def process_unseen(server, state):
                     fails.pop(msg_id, None)
                 else:
                     state["seen_ids"].remove(msg_id)   # allow a retry
+                    retry.add(uid)
                 continue
 
             # The reply is away, so the message is answered - record that on the
@@ -2057,6 +2062,18 @@ def process_unseen(server, state):
                 label(server, uid, LABEL_SKIPPED)
             except Exception:
                 pass
+
+    # Move the watermark up to the last message that is genuinely finished
+    # with. Without this it never advanced past the first scan: every wake-up
+    # re-fetched the whole backlog, and once seen_ids rolled past its cap the
+    # oldest of those would have been answered a second time. Anything held
+    # for a retry keeps the watermark behind it, so it is still picked up.
+    done = [u for u in uids if u not in retry]
+    if done:
+        mark = (min(retry) - 1) if retry else max(done)
+        if mark > (state.get("last_uid") or 0):
+            state["last_uid"] = mark
+            dirty = True
 
     try:
         if flagged:
