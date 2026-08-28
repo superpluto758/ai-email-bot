@@ -50,12 +50,12 @@ STATE_PATH = os.environ.get("STATE_PATH", "/data/state.json")
 
 # Owners of the assistant. Set in the environment and never changeable by
 # email - a From address is trivially forged, so this must not be editable
-# remotely.
+# remotely. Admins are unfiltered and never rate limited.
 ADMINS = _addresses("ADMIN_ADDRESSES")
 
-# Where alerts go. ALERT_ADDRESSES get the full alert including quoted text;
-# QUIET_ALERT_ADDRESSES get the same alert with all quotes removed, which suits
-# an address you would rather keep other people's words out of. May be empty.
+# Where alerts and scheduled reports go. ALERT_ADDRESSES get the full version
+# including quoted text; QUIET_ALERT_ADDRESSES get it with quotes removed,
+# which suits an address you would rather keep other people's words out of.
 ALERT_ADDRESSES = _addresses("ALERT_ADDRESSES") or list(ADMINS)
 QUIET_ALERT_ADDRESSES = _addresses("QUIET_ALERT_ADDRESSES")
 
@@ -87,8 +87,8 @@ MAX_SEEN_IDS = 3000
 
 # Abuse-safety limits. Repeatedly retrying a rejected login looks exactly like
 # credential stuffing to a mail provider and can get the account suspended, so
-# we give up rather than hammer. The send caps sit well under Gmail's own
-# limits, and the delay stops replies looking machine-timed.
+# we give up rather than hammer. The send caps should sit under your
+# provider's own limits, and the delay stops replies looking machine-timed.
 AUTH_FAIL_LIMIT = int(os.environ.get("AUTH_FAIL_LIMIT", "5"))
 MAX_SENDS_PER_HOUR = int(os.environ.get("MAX_SENDS_PER_HOUR", "20"))
 MAX_SENDS_PER_DAY = int(os.environ.get("MAX_SENDS_PER_DAY", "80"))
@@ -117,6 +117,13 @@ def load_state():
         "sent_times": [],
         "send_failures": {},
         "usage": {},
+        "spend": {},              # month -> {in, out, searches, usd}
+        "by_user": {},            # month -> address -> full per-person tally
+        "per_user_limits": {},    # address -> daily reply limit
+        "sent_to": {},            # address -> reply timestamps
+        "memory": {},             # address -> notes we keep about them
+        "last_heartbeat": 0,
+        "limit_notified": {},
     }
     try:
         with open(STATE_PATH) as fh:
@@ -151,6 +158,12 @@ def save_state(state):
     state["usage"] = usage
     state["usage_names"] = {k: v for k, v in (state.get("usage_names") or {}).items()
                             if k in usage}
+    sent = {}
+    for addr, times in (state.get("sent_to") or {}).items():
+        kept = [t for t in times if t > now - 86400]
+        if kept:
+            sent[addr] = kept
+    state["sent_to"] = sent
     directory = os.path.dirname(STATE_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -298,6 +311,42 @@ MAX_ONE_ATTACHMENT = 4 * 1024 * 1024      # API caps individual images
 MAX_ALL_ATTACHMENTS = 12 * 1024 * 1024    # keep the whole request sane
 MAX_ATTACHMENTS = 5
 MAX_SEND_ATTEMPTS = 3
+# Per-user daily reply limit. Admins are always unlimited. Individual people
+# can be given their own limit by email; those overrides live in the state file.
+PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "25"))
+
+# Heartbeat: how often to email the owners confirming the bot is alive. The
+# point is that silence becomes meaningful - if you stop getting these, it died.
+HEARTBEAT_DAYS = float(os.environ.get("HEARTBEAT_DAYS", "7"))
+
+# Scheduled reports to the owners: a weekly summary (which doubles as the
+# heartbeat) and a full summary when a month rolls over. "0" disables either.
+WEEKLY_REPORT_DAYS = float(os.environ.get("WEEKLY_REPORT_DAYS", "7"))
+MONTHLY_REPORT = os.environ.get("MONTHLY_REPORT", "1") not in ("0", "false", "no")
+
+# Simple questions can go to a cheaper model. Set to "" to always use the main
+# model. Routing is a cheap heuristic, not another API call.
+SIMPLE_MODEL = os.environ.get("SIMPLE_MODEL", "claude-sonnet-5")
+SIMPLE_MAX_CHARS = int(os.environ.get("SIMPLE_MAX_CHARS", "350"))
+
+# Remembering people between conversations. Notes are written by the model as
+# part of its normal reply, so this costs no extra API calls.
+MEMORY_ENABLED = os.environ.get("MEMORY_ENABLED", "1") not in ("0", "false", "no")
+MEMORY_MAX_CHARS = int(os.environ.get("MEMORY_MAX_CHARS", "1200"))
+
+# USD per million tokens, for the spend report. Update if pricing changes.
+PRICES = {
+    "claude-opus-5":   (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+WEB_SEARCH_USD = 0.01          # per search
+
+# Anthropic bills in USD; reports are shown in GBP. This is a fixed rate rather
+# than a live lookup - set it to whatever your card is actually converting at.
+USD_TO_GBP = float(os.environ.get("USD_TO_GBP", "0.79"))
+CURRENCY = os.environ.get("CURRENCY_SYMBOL", "\u00a3")
+
 USAGE_WINDOW = 90 * 86400      # how far back per-user counts are kept
 USAGE_COLUMNS = ((1, "1d"), (7, "7d"), (30, "30d"), (90, "3mo"))
 MAX_TRACKED_USERS = 500
@@ -522,6 +571,7 @@ def record_usage(state, sender):
     key = normalize(sender)
     state.setdefault("usage", {}).setdefault(key, []).append(time.time())
     state.setdefault("usage_names", {}).setdefault(key, sender)
+    user_tally(state, sender)["msgs_in"] += 1
 
 
 def usage_report(state, only=None):
@@ -547,18 +597,21 @@ def usage_report(state, only=None):
     for addr, times in usage.items():
         counts = [sum(1 for t in times if now - t < days * 86400)
                   for days, _ in USAGE_COLUMNS]
-        rows.append([names.get(addr, addr)] + counts)
-    rows.sort(key=lambda r: (-r[-1], r[0]))          # busiest over the longest window
+        lim = user_daily_limit(state, names.get(addr, addr))
+        rows.append([names.get(addr, addr)] + counts +
+                    ["unlimited" if lim is None else str(lim)])
+    rows.sort(key=lambda r: (-r[-2], r[0]))     # busiest over the longest window
 
     width = max([len(r[0]) for r in rows] + [len("User")])
-    cols = "".join(" %5s" % label for _, label in USAGE_COLUMNS)
-    line = "-" * (width + 2 + 6 * len(USAGE_COLUMNS))
+    cols = "".join(" %5s" % label for _, label in USAGE_COLUMNS) + " %9s" % "msg/day"
+    line = "-" * (width + 12 + 6 * len(USAGE_COLUMNS))
 
-    def render(name, counts):
-        return "%-*s " % (width, name) + "".join(" %5d" % c for c in counts)
+    def render(name, counts, lim=""):
+        return ("%-*s " % (width, name) + "".join(" %5s" % c for c in counts)
+                + " %9s" % lim)
 
     out = ["%-*s " % (width, "User") + cols, line]
-    out += [render(r[0], r[1:]) for r in rows]
+    out += [render(r[0], r[1:-1], r[-1]) for r in rows]
     out += [line, render("TOTAL", [sum(r[i] for r in rows)
                                    for i in range(1, len(USAGE_COLUMNS) + 1)])]
     out += ["", "Emails received per sender. Anything older than 3 months is discarded.",
@@ -566,6 +619,205 @@ def usage_report(state, only=None):
     if wanted and missing:
         out.append("No emails on record from: " + ", ".join(missing))
     return "\n".join(out)
+
+
+def user_tally(state, addr, month=None):
+    """The per-person record for a month: messages, tokens, searches, cost."""
+    month = month or datetime.now().strftime("%Y-%m")
+    return (state.setdefault("by_user", {}).setdefault(month, {})
+            .setdefault(normalize(addr),
+                        {"msgs_in": 0, "msgs_out": 0, "in": 0, "out": 0,
+                         "searches": 0, "usd": 0.0}))
+
+
+def record_spend(state, model, usage, searches=0, sender=None):
+    """Accumulate token spend by month so the owners can see the bill coming."""
+    if not usage:
+        return
+    month = datetime.now().strftime("%Y-%m")
+    bucket = state.setdefault("spend", {}).setdefault(
+        month, {"in": 0, "out": 0, "searches": 0, "usd": 0.0})
+    tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+    tout = usage.get("output_tokens", 0)
+    rate_in, rate_out = PRICES.get(model, PRICES["claude-opus-5"])
+    bucket["in"] += tin
+    bucket["out"] += tout
+    bucket["searches"] += searches
+    cost = (tin * rate_in + tout * rate_out) / 1_000_000 + searches * WEB_SEARCH_USD
+    bucket["usd"] += cost
+    if sender:
+        u = user_tally(state, sender, month)
+        u["in"] += tin
+        u["out"] += tout
+        u["searches"] += searches
+        u["usd"] += cost
+
+
+def spend_report(state):
+    months = state.get("spend") or {}
+    if not months:
+        return "No API spend recorded yet."
+    out = ["%-9s %12s %12s %9s %9s" % ("Month", "input tok", "output tok",
+                                       "searches", CURRENCY), "-" * 55]
+    total = 0.0
+    for month in sorted(months):
+        b = months[month]
+        total += b["usd"]
+        out.append("%-9s %12s %12s %9d %9s" % (
+            month, "{:,}".format(b["in"]), "{:,}".format(b["out"]),
+            b["searches"], "%s%.2f" % (CURRENCY, b["usd"] * USD_TO_GBP)))
+    out += ["-" * 55,
+            "%-9s %12s %12s %9s %9s" % ("TOTAL", "", "", "",
+                                        "%s%.2f" % (CURRENCY, total * USD_TO_GBP)),
+            "", "Estimated from published per-token prices and converted at %.2f "
+            "USD->GBP - the Anthropic console, in USD, is authoritative." % USD_TO_GBP]
+    return "\n".join(out)
+
+
+def cost_by_user(state, month=None, only=None):
+    """Full per-person breakdown for a month: messages, tokens, searches, cost."""
+    month = month or datetime.now().strftime("%Y-%m")
+    per_user = (state.get("by_user") or {}).get(month) or {}
+    if only:
+        wanted = [normalize(a) for a in only]
+        per_user = {k: v for k, v in per_user.items() if k in wanted}
+    if not per_user:
+        return "Nothing recorded for %s yet." % month
+
+    names = state.get("usage_names") or {}
+    rows = sorted(((names.get(k, k), v) for k, v in per_user.items()),
+                  key=lambda r: -r[1].get("usd", 0.0))
+    width = max([len(r[0]) for r in rows] + [len("User")])
+
+    head = ("%-*s %6s %6s %11s %11s %8s %9s"
+            % (width, "User", "sent", "recv", "input tok", "output tok",
+               "searches", CURRENCY))
+    line = "-" * len(head)
+    out = [head, line]
+    tot = {"msgs_in": 0, "msgs_out": 0, "in": 0, "out": 0, "searches": 0, "usd": 0.0}
+    for name, u in rows:
+        for k in tot:
+            tot[k] += u.get(k, 0)
+        out.append("%-*s %6d %6d %11s %11s %8d %9s"
+                   % (width, name, u.get("msgs_in", 0), u.get("msgs_out", 0),
+                      "{:,}".format(u.get("in", 0)), "{:,}".format(u.get("out", 0)),
+                      u.get("searches", 0),
+                      "%s%.2f" % (CURRENCY, u.get("usd", 0.0) * USD_TO_GBP)))
+    out += [line, "%-*s %6d %6d %11s %11s %8d %9s"
+            % (width, "TOTAL", tot["msgs_in"], tot["msgs_out"],
+               "{:,}".format(tot["in"]), "{:,}".format(tot["out"]),
+               tot["searches"], "%s%.2f" % (CURRENCY, tot["usd"] * USD_TO_GBP)),
+            "",
+            "sent = emails they sent in, recv = replies they got back.",
+            "Cost converted at %.2f USD->GBP; Anthropic bills in USD."
+            % USD_TO_GBP]
+    return "\n".join(out)
+
+
+def full_analytics(state, only=None):
+    """Everything an owner might want, in one reply.
+
+    Every analytics request returns this same shape - the system block and the
+    per-person table - so the answer never depends on how the question was
+    phrased. `only` narrows the per-person table to specific addresses."""
+    month = datetime.now().strftime("%Y-%m")
+    spend = (state.get("spend") or {}).get(month, {})
+    started = state.get("started_at")
+    uptime = ("%.1f days" % ((time.time() - started) / 86400)) if started else "unknown"
+    limits = state.get("per_user_limits") or {}
+
+    return "\n".join([
+        "SYSTEM",
+        "  Mailbox:          %s" % SELF,
+        "  Model:            %s   (simple questions -> %s)"
+        % (state.get("model"), SIMPLE_MODEL or "same"),
+        "  Running for:      %s" % uptime,
+        "  People allowed:   %d   (may send files: %d)"
+        % (len(state.get("allowlist", [])), len(state.get("file_allowlist", []))),
+        "  Default limit:    %s"
+        % ("unlimited" if PER_USER_DAILY_LIMIT <= 0
+           else "%d msg/day" % PER_USER_DAILY_LIMIT),
+        "  Custom limits:    %d set" % len(limits),
+        "  Send caps:        %d/hour, %d/day  (used today: %d)"
+        % (MAX_SENDS_PER_HOUR, MAX_SENDS_PER_DAY,
+           len([t for t in state.get("sent_times", []) if time.time() - t < 86400])),
+        "  This month:       %s%.2f across %s in / %s out tokens, %d searches"
+        % (CURRENCY, spend.get("usd", 0.0) * USD_TO_GBP,
+           "{:,}".format(spend.get("in", 0)), "{:,}".format(spend.get("out", 0)),
+           spend.get("searches", 0)),
+        "",
+        "THIS MONTH, PER PERSON (%s)%s" % (month, " - filtered" if only else ""),
+        cost_by_user(state, month, only),
+        "",
+        "EMAILS RECEIVED PER PERSON",
+        usage_report(state, only),
+        "",
+        "SPEND BY MONTH",
+        spend_report(state),
+    ])
+
+
+def user_daily_limit(state, addr):
+    """Replies per day allowed for this address. None means unlimited."""
+    if is_admin(addr):
+        return None                      # owners are never limited
+    override = (state.get("per_user_limits") or {}).get(normalize(addr))
+    if override is not None:
+        return None if int(override) <= 0 else int(override)
+    return PER_USER_DAILY_LIMIT if PER_USER_DAILY_LIMIT > 0 else None
+
+
+def over_user_limit(state, addr):
+    """Return (limit, used) if this sender has had their quota today."""
+    limit = user_daily_limit(state, addr)
+    if limit is None:
+        return None
+    now = time.time()
+    times = [t for t in (state.get("sent_to") or {}).get(normalize(addr), [])
+             if now - t < 86400]
+    return (limit, len(times)) if len(times) >= limit else None
+
+
+def record_reply_to(state, addr):
+    state.setdefault("sent_to", {}).setdefault(normalize(addr), []).append(time.time())
+    user_tally(state, addr)["msgs_out"] += 1
+
+
+def get_memory(state, addr):
+    if not MEMORY_ENABLED:
+        return ""
+    return (state.get("memory") or {}).get(normalize(addr), "")
+
+
+def add_memory(state, addr, note):
+    """Keep a short rolling note about a person, oldest trimmed first."""
+    if not MEMORY_ENABLED or not note:
+        return
+    note = re.sub(r"\s+", " ", str(note)).strip()
+    if not note:
+        return
+    key = normalize(addr)
+    mem = state.setdefault("memory", {})
+    combined = (mem.get(key, "") + "\n- " + note).strip()
+    while len(combined) > MEMORY_MAX_CHARS and "\n- " in combined:
+        combined = combined.split("\n- ", 1)[1]
+        combined = "- " + combined
+    mem[key] = combined
+
+
+def pick_model(state, thread_text, attachments, is_owner):
+    """Cheap heuristic routing - short plain questions do not need the top model."""
+    main = state["model"]
+    if not SIMPLE_MODEL or SIMPLE_MODEL == main:
+        return main
+    if attachments or is_owner:
+        return main
+    if len(thread_text) > SIMPLE_MAX_CHARS:
+        return main
+    if re.search(r"\b(latest|current|today|news|now|recent|price|score|who is "
+                 r"the|202[5-9])\b", thread_text, re.I):
+        return main                      # anything time-sensitive gets the best
+    return SIMPLE_MODEL
 
 
 def over_send_limit(state):
@@ -676,16 +928,30 @@ NON_ADMIN_POLICY = (
 )
 
 
-def answer_normally(state, thread_text, attachments=None):
+def answer_normally(state, thread_text, attachments=None, sender=""):
     system = guardrails() + " Reply style: " + state["style"] + "." + NON_ADMIN_POLICY
+    mem = get_memory(state, sender)
+    if mem:
+        system += (" WHAT YOU ALREADY KNOW about this person from previous "
+                   "emails (use it naturally, never recite it back at them):\n"
+                   + mem)
+    if MEMORY_ENABLED:
+        system += (" Also include a \"memory\" field: one short factual line worth "
+                   "remembering about this person for next time (their subject, "
+                   "year group, what they are working on), or \"\" if nothing is "
+                   "worth keeping. Never record anything sensitive, medical or "
+                   "personal beyond what helps you help them.")
     prompt = (thread_text + "\n\nWrite the reply to this message. "
               "Output ONLY the reply body.")
     # Images before text is the documented ordering for best results.
     content = list(attachments or []) + [{"type": "text", "text": prompt}]
-    return call_claude(state["model"], system, content, web_search=True)
+    model = pick_model(state, thread_text, attachments, is_owner=False)
+    if model != state["model"]:
+        log.info("routed to %s (simple question)", model)
+    return call_claude(model, system, content, web_search=True)
 
 
-def handle_admin(state, thread_text, attachments=None):
+def handle_admin(state, thread_text, attachments=None, sender=""):
     system = (guardrails() +
               " The sender is an ADMIN (an owner of this assistant). Reply "
               "style: " + state["style"] + "."
@@ -693,7 +959,10 @@ def handle_admin(state, thread_text, attachments=None):
               "message requests any of: adding/removing auto-reply allowlist "
               "addresses, adding/removing FILE permission (who may send "
               "attachments - a separate, smaller list), changing reply style, "
-              "or switching model, or ASKING FOR USAGE STATS (how many emails "
+              "or switching model, setting a per-person daily reply limit, asking "
+              "for ANALYTICS or a full report, asking "
+              "about COST or SPEND, or asking what is remembered about someone "
+              "(or to forget them), or ASKING FOR USAGE STATS (how many emails "
               "each user has sent - set usage_report true and do not invent "
               "numbers, the real table is appended for you), "
               '("use opus" = claude-opus-5, "use sonnet" = claude-sonnet-5). '
@@ -711,12 +980,21 @@ def handle_admin(state, thread_text, attachments=None):
               '"usage_report": true if they asked how many emails have been sent, '
               'for usage/stats/counts/activity, else false, '
               '"usage_for": [emails] if they asked about specific people only, '
+              '"spend_report": true if they asked about cost, spend, billing or '
+              'tokens, "set_limits": {"email": number} for per-person daily reply '
+              'limits (0 or "unlimited" means no limit; admins are always '
+              'unlimited), "clear_memory": [emails] if they asked to forget '
+              'someone, "memory_for": [emails] if they asked what is remembered '
+              'about someone, '
               'else [] for everyone, '
               '"style": string or null, '
               '"model": "claude-opus-5"|"claude-sonnet-5"|null, '
               '"reply": "the full reply body, answering any question asked and '
               'confirming exactly which settings changed, if any"}')
     # Admins get attachments and web search, same as anyone else.
+    mem = get_memory(state, sender)
+    if mem:
+        system += (" WHAT YOU ALREADY KNOW about this person:\n" + mem)
     content = list(attachments or []) + [{"type": "text", "text": thread_text}]
     raw = call_claude(state["model"], system, content, web_search=True)
     if raw is None:
@@ -775,29 +1053,64 @@ def handle_admin(state, thread_text, attachments=None):
         changes.append("model set to " + parsed["model"])
     if changes:
         log.info("admin changes: %s", "; ".join(changes))
+    # --- apply every requested change first, then build the reply once ------
+    limits = state.setdefault("per_user_limits", {})
+    for addr, val in (parsed.get("set_limits") or {}).items():
+        addr = str(addr).strip().lower()
+        if is_admin(addr):
+            protected.append(addr)
+            continue
+        try:
+            n = 0 if str(val).strip().lower() in ("unlimited", "none", "off") else int(val)
+        except (TypeError, ValueError):
+            continue
+        limits[normalize(addr)] = n
+        changes.append("set %s %s" % (addr, "unlimited" if n <= 0 else "%d msg/day" % n))
+
+    for addr in parsed.get("clear_memory") or []:
+        addr = str(addr).strip().lower()
+        if (state.get("memory") or {}).pop(normalize(addr), None) is not None:
+            changes.append("forgot everything about " + addr)
+
+    if changes:
+        log.info("admin changes: %s", "; ".join(changes))
+
     reply = parsed.get("reply") or "Request received."
+
+    # Reports are generated by code and appended, so the model cannot invent
+    # figures. All three are reachable only from here, i.e. only by admins.
+    # Any analytics question - cost, usage, a named person, or just "how's it
+    # going" - returns the same full picture, so the reply never depends on the
+    # wording. usage_for narrows the per-person tables to those addresses.
+    if (parsed.get("analytics") or parsed.get("spend_report")
+            or parsed.get("usage_report")):
+        only = parsed.get("usage_for") or None
+        log.info("analytics requested%s", " for %s" % ", ".join(only) if only else "")
+        reply += "\n\n" + full_analytics(state, only)
+
+    for addr in parsed.get("memory_for") or []:
+        addr = str(addr).strip().lower()
+        reply += "\n\nWhat is remembered about %s:\n%s" % (
+            addr, get_memory(state, addr) or "  (nothing yet)")
+
     # The authoritative record of what actually happened, written by the code
     # rather than the model, so the email can never contradict reality. Only
     # added when settings were actually asked about - an ordinary question from
     # an admin should not come back with "Applied: no changes." stuck on it.
     asked_about_settings = any(parsed.get(k) for k in
                                ("add", "remove", "file_add", "file_remove",
-                                "style", "model"))
+                                "style", "model", "set_limits", "clear_memory"))
     if asked_about_settings or changes or protected:
         reply += ("\n\nApplied: " + "; ".join(changes) + "."
                   if changes else "\n\nApplied: no changes.")
-    if parsed.get("usage_report"):
-        log.info("usage report requested")
-        reply = (parsed.get("reply") or "Here are the current per-user counts:")
-        reply += "\n\n" + usage_report(state, parsed.get("usage_for") or None)
-        parsed["reply"] = reply
 
     if protected:
-        log.info("refused to remove admin address(es): %s", ", ".join(protected))
-        reply += ("\n\n(Note: %s could not be removed - admin addresses are "
-                  "protected, because removing one would cut off email control "
-                  "of this assistant. That can only be changed in the bot's "
-                  "configuration.)" % ", ".join(sorted(set(protected))))
+        log.info("refused to change admin address(es): %s", ", ".join(protected))
+        reply += ("\n\n(Note: %s could not be changed - admin addresses are "
+                  "protected: they are never rate limited and cannot be removed, "
+                  "because that would cut off email control of this assistant. "
+                  "That can only be changed in the bot's configuration.)"
+                  % ", ".join(sorted(set(protected))))
     return reply
 
 
@@ -908,6 +1221,66 @@ def send_flag_alerts(flagged):
 
 # ------------------------------------------------------------ processing ---
 
+def _report_body(state, heading, month, note):
+    """Scheduled reports use exactly the same layout as an on-demand one."""
+    return "%s\n\n%s\n\n%s" % (heading, full_analytics(state), note)
+
+
+def maybe_reports(state):
+    """Weekly and monthly summaries to the owners.
+
+    The weekly one doubles as a heartbeat: if it stops arriving, the bot has
+    died or the machine is offline, which is otherwise invisible."""
+    if not ALERT_ADDRESSES:
+        return
+    now = time.time()
+    this_month = datetime.now().strftime("%Y-%m")
+
+    # --- monthly, on the first run after the month rolls over ---------------
+    last_month_sent = state.get("last_monthly_month")
+    if MONTHLY_REPORT:
+        if not last_month_sent:
+            state["last_monthly_month"] = this_month       # start the clock
+        elif last_month_sent != this_month:
+            try:
+                send_mail(ALERT_ADDRESSES,
+                          "%s monthly summary - %s" % (FLAG_PREFIX, last_month_sent),
+                          _report_body(state,
+                                       "Monthly summary for %s." % last_month_sent,
+                                       last_month_sent,
+                                       "This closes out %s. Figures are estimated "
+                                       "from published per-token prices."
+                                       % last_month_sent))
+                record_send(state)
+                state["last_monthly_month"] = this_month
+                log.info("monthly summary sent for %s", last_month_sent)
+            except Exception as exc:
+                log.error("monthly summary failed: %s", exc)
+
+    # --- weekly -------------------------------------------------------------
+    if WEEKLY_REPORT_DAYS <= 0:
+        return
+    last = state.get("last_heartbeat") or 0
+    if not last:
+        state["last_heartbeat"] = now                      # start the clock
+        return
+    if now - last < WEEKLY_REPORT_DAYS * 86400:
+        return
+    try:
+        send_mail(ALERT_ADDRESSES,
+                  "%s weekly summary - assistant is running" % FLAG_PREFIX,
+                  _report_body(state, "The email assistant is alive and connected.",
+                               this_month,
+                               "You get this every %g days. If it stops arriving, "
+                               "the bot has died or the machine it runs on is "
+                               "offline - worth checking." % WEEKLY_REPORT_DAYS))
+        record_send(state)
+        state["last_heartbeat"] = now
+        log.info("weekly summary sent")
+    except Exception as exc:
+        log.error("weekly summary failed: %s", exc)
+
+
 def process_unseen(server, state):
     try:
         uids = server.search(["UNSEEN"])
@@ -1009,6 +1382,49 @@ def process_unseen(server, state):
             mark_seen(server, uid)
             continue
 
+        hit = over_user_limit(state, sender)
+        if hit:
+            limit, used = hit
+            log.info("%s has had %d/%d replies today - declining", sender, used, limit)
+            already = state.setdefault("limit_notified", {})
+            day = datetime.now().strftime("%Y-%m-%d")
+            if already.get(normalize(sender)) != day:
+                # Once per person per day, so a chatty sender cannot spam you.
+                already[normalize(sender)] = day
+                try:
+                    send_mail(ALERT_ADDRESSES,
+                              "%s daily limit reached - %s" % (FLAG_PREFIX, sender),
+                              "%s has hit their daily limit and is no longer being "
+                              "answered today.\n\n"
+                              "  Sender:  %s\n"
+                              "  Limit:   %d msg/day\n"
+                              "  Used:    %d\n"
+                              "  Subject: %s\n\n"
+                              "They were told to try again tomorrow. To raise it, "
+                              "reply to the assistant with:\n"
+                              "  set %s 50 msg/day"
+                              % (sender, msg.get("From", sender), limit, used,
+                                 subject or "(none)", sender))
+                    record_send(state)
+                except Exception as exc:
+                    log.error("limit alert failed: %s", exc)
+            human_pause()
+            try:
+                send_mail([sender], reply_subject(subject, body),
+                          "You have reached your daily limit of %d replies from "
+                          "this assistant. It will start answering you again "
+                          "tomorrow.\n\nIf you need more, ask an admin to raise "
+                          "your limit." % limit,
+                          in_reply_to=msg.get("Message-ID"),
+                          references=" ".join(filter(None, [msg.get("References"),
+                                                            msg.get("Message-ID")])))
+                record_send(state)
+            except Exception as exc:
+                log.error("limit notice failed for %s: %s", sender, exc)
+            label(server, uid, LABEL_SKIPPED)
+            mark_seen(server, uid)
+            continue
+
         limited = over_send_limit(state)
         if limited:
             log.warning("holding reply to %s - %s; will retry later", sender, limited)
@@ -1081,11 +1497,14 @@ def process_unseen(server, state):
 
         policy_alert = None
         if is_admin(sender):
-            reply = handle_admin(state, thread_text, attachments)   # owners unfiltered
+            reply = handle_admin(state, thread_text, attachments, sender)  # unfiltered
         else:
+            raw_reply = answer_normally(state, thread_text, attachments, sender)
+            note = (parse_json(raw_reply) or {}).get("memory") if raw_reply else None
+            if note:
+                add_memory(state, sender, note)
             reply, policy_alert = apply_policy(
-                answer_normally(state, thread_text, attachments),
-                sender, msg.get("From", sender), subject, received)
+                raw_reply, sender, msg.get("From", sender), subject, received)
             if policy_alert:
                 log.info("content policy: %s from %s - %s", policy_alert["category"],
                          sender, policy_alert["action"])
@@ -1118,6 +1537,9 @@ def process_unseen(server, state):
 
         state.get("send_failures", {}).pop(msg_id, None)
         record_send(state)
+        record_reply_to(state, sender)
+        record_spend(state, LAST_CALL.get("model", state["model"]),
+                     LAST_CALL.get("usage"), LAST_CALL.get("searches", 0), sender)
         if policy_alert:
             try:
                 record_send(state)
@@ -1149,6 +1571,7 @@ def main():
         sys.exit(1)
 
     state = load_state()
+    state.setdefault("started_at", time.time())
     log.info("AI email answerer starting - mailbox=%s via %s | model=%s | allowlist=%d",
              SELF, IMAP_HOST, state["model"], len(state["allowlist"]))
 
@@ -1168,6 +1591,7 @@ def main():
                     server.idle()
                     responses = server.idle_check(timeout=IDLE_REFRESH)
                     server.idle_done()
+                    maybe_reports(state)
                     if responses:
                         log.info("new mail signal: %s", responses[:3])
                         process_unseen(server, state)

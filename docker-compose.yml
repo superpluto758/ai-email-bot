@@ -60,6 +60,32 @@ services:
       REPLY_DELAY_MIN: "5"
       REPLY_DELAY_MAX: "15"
 
+      # ---- limits, reports and analytics ----------------------------------
+      # Replies per person per day. Admins are always unlimited. Individual
+      # people can be given their own limit by email.
+      PER_USER_DAILY_LIMIT: "25"
+
+      # Scheduled summaries to the owners. The weekly one doubles as a
+      # heartbeat: if it stops arriving, the bot or its machine is down.
+      WEEKLY_REPORT_DAYS: "7"         # "0" disables
+      MONTHLY_REPORT: "1"             # month-end summary; "0" disables
+
+      # Reports are shown in your currency. Anthropic bills in USD; this is a
+      # fixed rate, not a live lookup.
+      USD_TO_GBP: "0.79"
+      CURRENCY_SYMBOL: "£"
+
+      # Short, plain questions can go to a cheaper model. Set to "" to always
+      # use the main one. This is a free heuristic, not an extra API call.
+      SIMPLE_MODEL: "claude-sonnet-5"
+      SIMPLE_MAX_CHARS: "350"
+
+      # Remembering people between conversations. Notes are written by the
+      # model as part of its normal reply, so this costs no extra API calls,
+      # and they are stored alongside the allowlist in the state file.
+      MEMORY_ENABLED: "1"             # "0" remembers nothing
+      MEMORY_MAX_CHARS: "1200"
+
     volumes:
       - ./bot.py:/app/bot.py:ro
       - ./data:/data           # allowlist, usage counts and state live here

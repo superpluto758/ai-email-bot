@@ -26,7 +26,14 @@ another account on someone else's platform.
   who may send files
 - **Admin commands by email** — add and remove people, change tone, switch
   model, request usage stats, all in plain English
-- **Per-user usage counters** over 1 day, 7 days, 30 days and 3 months
+- **Per-user limits** — a daily reply cap per person, editable by email; owners
+  are always unlimited
+- **Analytics on demand** — messages, tokens, searches and cost per person
+- **Weekly and monthly summaries** emailed to the owners, the weekly one
+  doubling as a heartbeat
+- **Memory** — it remembers useful context about the people who write to it,
+  stored on your own machine
+- **Cheaper routing** — short, plain questions go to a smaller model
 - **A content policy for non-owners**, with alerts to you when it triggers
 
 ## What it deliberately will not do
@@ -116,12 +123,59 @@ From an admin address, in plain English:
 | Revoke file permission | `remove alice@example.com from the file allowlist` |
 | Change tone | `keep replies shorter and more casual` |
 | Switch model | `use sonnet` / `use opus` |
-| Usage stats | `how many emails has everyone sent` |
-| Stats for one person | `how many emails has alice@example.com sent` |
+| Analytics | `show me the analytics` / `how's it going?` |
+| Cost | `what have I spent this month?` |
+| Stats for one person | `how much has alice@example.com used?` |
+| Set someone's limit | `set alice@example.com 25 msg/day` |
+| Remove a limit | `make alice unlimited` |
+| What it remembers | `what do you know about alice@example.com?` |
+| Forget someone | `forget everything about alice@example.com` |
 
 There is no fixed syntax — the request is interpreted, not pattern-matched. The
 reply always ends with an authoritative `Applied:` line written by the code, so
 it cannot claim a change that did not happen.
+
+### Analytics
+
+Any analytics question returns the same full picture, so the answer never
+depends on how you phrased it:
+
+```
+SYSTEM
+  Mailbox:          you@example.com
+  Model:            claude-opus-5   (simple questions -> claude-sonnet-5)
+  Running for:      4.2 days
+  People allowed:   5   (may send files: 4)
+  Default limit:    25 msg/day
+  Send caps:        30/hour, 150/day  (used today: 7)
+  This month:       £10.98 across 1,300,000 in / 290,000 out tokens, 15 searches
+
+THIS MONTH, PER PERSON (2026-08)
+User                    sent   recv   input tok  output tok searches         £
+alice@example.com          9      8     900,000     200,000       12     £7.60
+bob@example.com            6      4     400,000      90,000        3     £3.38
+```
+
+`sent` is what they emailed in, `recv` is what they got back — a gap between
+them means messages were declined, rate limited or skipped.
+
+Naming someone narrows both tables to them. The same layout is emailed weekly
+and at month end, so the scheduled report and the on-demand one can never drift
+apart.
+
+### Memory
+
+The model returns a short note with each reply — no extra API call — and it is
+kept per person in the state file on your own machine, then fed back into that
+person's next conversation:
+
+```
+- Year 11, doing GCSE physics
+- Prefers short answers with worked examples
+```
+
+Capped and trimmed oldest-first. Ask what it knows, or tell it to forget
+someone, at any time. Set `MEMORY_ENABLED: "0"` to keep nothing.
 
 ### The content policy
 
@@ -159,6 +213,11 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `QUIET_ALERT_ADDRESSES` | | Same alerts, quotes removed |
 | `FROM_NAME` | | Display name on replies |
 | `MAX_SENDS_PER_HOUR` / `MAX_SENDS_PER_DAY` | | Send caps |
+| `PER_USER_DAILY_LIMIT` | | Replies per person per day; admins exempt |
+| `WEEKLY_REPORT_DAYS` / `MONTHLY_REPORT` | | Scheduled summaries; `0` disables |
+| `USD_TO_GBP` / `CURRENCY_SYMBOL` | | Currency for reports |
+| `SIMPLE_MODEL` / `SIMPLE_MAX_CHARS` | | Cheaper model for short questions |
+| `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` | | Remembering people between emails |
 | `REPLY_DELAY_MIN` / `REPLY_DELAY_MAX` | | Random delay, seconds |
 | `AUTH_FAIL_LIMIT` | | Rejected logins before it stops |
 | `TZ`, `STATE_PATH` | | Timezone, state file location |
@@ -192,6 +251,11 @@ by emailing `use sonnet`, and keep an eye on the console.
 
 The send caps limit outbound mail. They do **not** cap spend — a blocked message
 still cost an API call to classify.
+
+Two things help: `SIMPLE_MODEL` routes short questions to a cheaper model for
+free, and the weekly report tells you what each person is costing before the
+bill does. Currency conversion uses a fixed rate you set; Anthropic bills in
+USD, so their console is authoritative.
 
 ---
 
