@@ -87,6 +87,18 @@ ALLOWED_MODELS = {"claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5",
 # for them by name.
 NEVER_AUTO_ROUTE = {"claude-fable-5"}
 
+# Reasoning effort (output_config.effort). "high" is the API default, so an
+# omitted value is not "no thinking" - it is high. Owners get more depth than
+# the people writing in, because they are the ones asking the hard questions.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+ADMIN_EFFORT = {
+    "claude-opus-5":   "xhigh",
+    "claude-sonnet-5": "max",
+    "claude-fable-5":  "xhigh",
+}
+# Haiku 4.5 rejects output_config.effort outright, so it must never be sent.
+NO_EFFORT_MODELS = {"claude-haiku-4-5"}
+
 LABEL_ANSWERED = "ai-answered"
 LABEL_DENIED = "ai-denied"
 LABEL_SKIPPED = "ai-skipped"
@@ -145,6 +157,8 @@ def load_state():
         "spend_week": {},         # ISO week -> same shape
         "by_user": {},            # month -> address -> full per-person tally
         "per_user_limits": {},    # address -> daily reply limit
+        "opus_allowlist": [],     # non-owners an owner has allowed on the main model
+        "effort": None,           # owner-set reasoning effort, or None for the default
         "sent_to": {},            # address -> reply timestamps
         "memory": {},             # address -> notes we keep about them
         "last_heartbeat": 0,
@@ -515,7 +529,8 @@ def _note_usage(model, data):
     LAST_CALL["model"] = model
 
 
-def call_claude(model, system, user_content, max_tokens=6000, web_search=False):
+def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
+                effort=None):
     """Call the Messages API. With web_search=True Claude may look facts up.
 
     Server-tool turns can come back as stop_reason "pause_turn", meaning Claude
@@ -532,6 +547,8 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False):
         "max_tokens": max_tokens,
         "system": system,
     }
+    if effort and model not in NO_EFFORT_MODELS:
+        payload["output_config"] = {"effort": effort}
     if web_search:
         payload["tools"] = [{"type": "web_search_20260209",
                              "name": "web_search",
@@ -1029,25 +1046,59 @@ def add_memory(state, addr, note):
     mem[key] = combined
 
 
-def pick_model(state, thread_text, attachments, is_owner):
+def may_use_opus(state, addr):
+    """Non-owners reach the main model only if an owner has allowed it."""
+    return is_admin(addr) or in_list(addr, state.get("opus_allowlist") or [])
+
+
+def pick_model(state, question, attachments, sender="", is_owner=False):
     """Route by how much work the question needs.
 
-    Very short questions go to Haiku, short ones to Sonnet, everything else to
-    the configured main model. Automatic routing never picks a top-tier model
-    like Fable - that only happens when an admin asks for it by name."""
-    main = state["model"]
-    if attachments or is_owner:
-        return main
-    if re.search(r"\b(latest|current|today|news|now|recent|price|score|who is "
-                 r"the|202[5-9])\b", thread_text, re.I):
-        return main                      # anything time-sensitive gets the main model
+    `question` is what the sender actually typed - not the headers and not the
+    quoted thread. Measuring the whole message meant a 12-character question
+    from someone with a long name missed the cheap tier entirely, and every
+    reply in a thread went to the main model because the quoted history
+    counted towards the length.
 
-    size = len(thread_text)
-    for model, ceiling in ((TRIVIAL_MODEL, TRIVIAL_MAX_CHARS),
-                           (SIMPLE_MODEL, SIMPLE_MAX_CHARS)):
-        if model and model not in NEVER_AUTO_ROUTE and size <= ceiling:
-            return model
-    return main
+    Owners always get the main model. Everyone else is capped at the simple
+    tier unless an owner has put them on the opus list, so a stranger cannot
+    run up a bill on the expensive model."""
+    main = state["model"]
+    if is_owner:
+        return main
+
+    # The most expensive model this sender is allowed to reach.
+    ceiling = main if may_use_opus(state, sender) else (SIMPLE_MODEL or main)
+
+    # Escalate before looking at length. A photo to read or a question about
+    # something current needs a capable model however few words it took to
+    # ask - "what does this say?" is nine words and needs to see an image.
+    if attachments:
+        return ceiling
+    if re.search(r"\b(latest|current|today|news|now|recent|price|score|"
+                 r"who is the|202[5-9])\b", question or "", re.I):
+        return ceiling
+
+    size = len(question or "")
+    if TRIVIAL_MODEL and TRIVIAL_MODEL not in NEVER_AUTO_ROUTE \
+            and size <= TRIVIAL_MAX_CHARS:
+        return TRIVIAL_MODEL
+    if SIMPLE_MODEL and SIMPLE_MODEL not in NEVER_AUTO_ROUTE \
+            and size <= SIMPLE_MAX_CHARS:
+        return SIMPLE_MODEL
+    return ceiling
+
+
+def pick_effort(state, model, is_owner):
+    """How hard the model should think. None omits the parameter entirely."""
+    if model in NO_EFFORT_MODELS:
+        return None                      # it rejects the parameter
+    if not is_owner:
+        return None                      # the people writing in get the default
+    override = state.get("effort")
+    if override in EFFORT_LEVELS:
+        return override                  # an owner asked for a specific level
+    return ADMIN_EFFORT.get(model)
 
 
 def over_send_limit(state):
@@ -1185,7 +1236,8 @@ NON_ADMIN_POLICY = (
 )
 
 
-def answer_normally(state, thread_text, attachments=None, sender=""):
+def answer_normally(state, thread_text, attachments=None, sender="",
+                    question=""):
     system = guardrails() + " Reply style: " + state["style"] + "." + NON_ADMIN_POLICY
     mem = get_memory(state, sender)
     if mem:
@@ -1202,10 +1254,11 @@ def answer_normally(state, thread_text, attachments=None, sender=""):
               "Output ONLY the reply body.")
     # Images before text is the documented ordering for best results.
     content = list(attachments or []) + [{"type": "text", "text": prompt}]
-    model = pick_model(state, thread_text, attachments, is_owner=False)
+    model = pick_model(state, question or thread_text, attachments, sender)
+    effort = pick_effort(state, model, is_owner=False)
     if model != state["model"]:
-        log.info("routed to %s (simple question)", model)
-    return call_claude(model, system, content, web_search=True)
+        log.info("routed to %s (%d chars typed)", model, len(question or thread_text))
+    return call_claude(model, system, content, web_search=True, effort=effort)
 
 
 def handle_admin(state, thread_text, attachments=None, sender=""):
@@ -1217,7 +1270,10 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
               "addresses, adding/removing FILE permission (who may send "
               "attachments - a separate, smaller list), changing reply style, "
               "or switching model, setting a per-person daily reply limit, asking "
-              "for ANALYTICS or a full report, asking "
+              "for ANALYTICS or a full report, allowing or revoking permission "
+              "to use the top model (a separate, smaller list again - people not "
+              "on it are answered by the cheaper models), setting the reasoning "
+              "effort level, asking "
               "about COST or SPEND, or asking what is remembered about someone "
               "(or to forget them), or ASKING FOR USAGE STATS (how many emails "
               "each user has sent - set usage_report true and do not invent "
@@ -1248,6 +1304,11 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
               '"style": string or null, '
               '"model": one of claude-opus-5, claude-sonnet-5, claude-haiku-4-5, '
               'claude-fable-5, or null if no model change was asked for, '
+              '"opus_add": [emails] if they asked to let someone use the top '
+              'model, "opus_remove": [emails] if they asked to take that away, '
+              '"effort": "low"|"medium"|"high"|"xhigh"|"max" if they asked you '
+              'to think harder or less hard ("max effort", "think as hard as you '
+              'can" = max), or null, '
               '"reply": "the full reply body, answering any question asked and '
               'confirming exactly which settings changed, if any"}')
     # Admins get attachments and web search, same as anyone else.
@@ -1255,7 +1316,8 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
     if mem:
         system += (" WHAT YOU ALREADY KNOW about this person:\n" + mem)
     content = list(attachments or []) + [{"type": "text", "text": thread_text}]
-    raw = call_claude(state["model"], system, content, web_search=True)
+    raw = call_claude(state["model"], system, content, web_search=True,
+                      effort=pick_effort(state, state["model"], is_owner=True))
     if raw is None:
         return None
     parsed = parse_json(raw)
@@ -1310,6 +1372,24 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
     if parsed.get("model") in ALLOWED_MODELS:
         state["model"] = parsed["model"]
         changes.append("model set to " + parsed["model"])
+    if parsed.get("effort") in EFFORT_LEVELS:
+        state["effort"] = parsed["effort"]
+        changes.append("effort set to " + parsed["effort"])
+
+    opus = state.setdefault("opus_allowlist", [])
+    for addr in parsed.get("opus_add") or []:
+        addr = str(addr).strip().lower()
+        if not EMAIL_RE.match(addr) or in_list(addr, opus) or is_admin(addr):
+            continue
+        opus.append(addr)
+        changes.append("may now use the top model: " + addr)
+    for addr in parsed.get("opus_remove") or []:
+        addr = str(addr).strip().lower()
+        before = len(opus)
+        state["opus_allowlist"] = opus = [
+            a for a in opus if normalize(a) != normalize(addr)]
+        if len(opus) < before:
+            changes.append("may no longer use the top model: " + addr)
     if changes:
         log.info("admin changes: %s", "; ".join(changes))
     # --- apply every requested change first, then build the reply once ------
@@ -1884,7 +1964,8 @@ def process_unseen(server, state):
             if is_admin(sender):
                 reply = handle_admin(state, thread_text, attachments, sender)  # unfiltered
             else:
-                raw_reply = answer_normally(state, thread_text, attachments, sender)
+                raw_reply = answer_normally(state, thread_text, attachments, sender,
+                                            question=own_text or subject)
                 note = (parse_json(raw_reply) or {}).get("memory") if raw_reply else None
                 if note:
                     add_memory(state, sender, note)

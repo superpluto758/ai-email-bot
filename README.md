@@ -34,7 +34,8 @@ another account on someone else's platform.
 - **Memory** — it remembers useful context about the people who write to it,
   stored on your own machine
 - **Tiered routing** — trivial questions go to Haiku, short ones to Sonnet, the
-  rest to your main model, automatically and for free
+  rest to your main model, automatically and for free. The top model is a
+  per-person permission for everyone but the owners
 - **A content policy for non-owners**, with alerts to you when it triggers
 - **A quiet flag** when someone who is not an owner tries to act like one — they
   get their normal reply, nothing changes, and you hear about it
@@ -149,6 +150,9 @@ From an admin address, in plain English:
 | Cost week by week | `show me the weekly spend` |
 | Stats for one person | `how much has alice@example.com used?` |
 | Set someone's limit | `set alice@example.com 25 msg/day` |
+| Let someone use the top model | `let alice@example.com use the top model` |
+| Revoke that | `stop alice@example.com using the top model` |
+| Think harder | `use max effort` |
 | Remove a limit | `make alice unlimited` |
 | What it remembers | `what do you know about alice@example.com?` |
 | Forget someone | `forget everything about alice@example.com` |
@@ -235,16 +239,52 @@ someone, at any time. Set `MEMORY_ENABLED: "0"` to keep nothing.
 ### Model routing
 
 Not every question needs the expensive model, and the routing is a free
-length-and-shape check rather than an extra API call:
+length-and-shape check rather than an extra API call.
 
-| Message | Goes to |
+**Owners always get the main model.** Everyone else is capped at the simple
+tier — the expensive model is a permission an owner grants per person, so a
+stranger cannot run up a bill on it:
+
+| | Ordinary sender | Granted the top model | Owner |
+|---|---|---|---|
+| `"hi"` | Haiku | Haiku | main `MODEL` |
+| `"what is 7x8?"` | Haiku | Haiku | main `MODEL` |
+| 325-character question | Sonnet | Sonnet | main `MODEL` |
+| Anything time-sensitive | Sonnet | main `MODEL` | main `MODEL` |
+| Anything with an attachment | Sonnet | main `MODEL` | main `MODEL` |
+
+Length is measured on **what the sender actually typed** — not the headers, not
+the quoted thread. Measuring the whole message meant a twelve-character
+question from someone with a long name missed the cheap tier, and every reply
+in a thread went to the main model because the quoted history counted.
+
+Escalation is checked before length, because "what does this say?" is nineteen
+characters and still needs a model that can see the attached photo.
+
+Grant and revoke with `let alice@example.com use the top model` /
+`stop alice@example.com using the top model`. Models in `NEVER_AUTO_ROUTE` are
+never chosen automatically — an admin has to ask for them by name. Set either
+tier to `""` to switch it off.
+
+### Reasoning effort
+
+Owners get more thinking depth than the people writing in, since they are the
+ones asking the hard questions. This is `output_config.effort`, where `high` is
+the API default — an omitted value is not "no thinking":
+
+| | Effort |
 |---|---|
-| Under `TRIVIAL_MAX_CHARS` | `TRIVIAL_MODEL` (Haiku) |
-| Under `SIMPLE_MAX_CHARS` | `SIMPLE_MODEL` (Sonnet) |
-| Anything with an attachment, from an owner, or mentioning something time-sensitive | your main `MODEL` |
+| Owner, main model Opus | `xhigh` |
+| Owner, main model Sonnet | `max` |
+| Owner, main model Fable | `xhigh` |
+| Everyone else | the default (`high`) |
 
-Models in `NEVER_AUTO_ROUTE` are never chosen automatically — an admin has to
-ask for them by name. Set either tier to `""` to switch it off.
+An owner can override it for themselves with `use max effort` (or `low`,
+`medium`, `high`, `xhigh`). Only those five levels are accepted; anything else
+is ignored rather than sent.
+
+Haiku rejects the parameter outright, so it is never sent on that model —
+including when an override is set.
 
 ### Who gets flagged
 
