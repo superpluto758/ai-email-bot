@@ -26,8 +26,8 @@ another account on someone else's platform.
   who may send files
 - **Admin commands by email** — add and remove people, change tone, switch
   model, request usage stats, all in plain English
-- **Per-user limits** — a daily reply cap per person, editable by email; owners
-  are always unlimited
+- **Per-user limits** — 30 replies per person per day by default, editable by
+  email and per person; owners are always unlimited
 - **Analytics on demand** — messages, tokens, searches and cost per person
 - **Weekly, monthly and yearly summaries** emailed to you, the weekly one
   doubling as a heartbeat
@@ -166,9 +166,10 @@ depends on how you phrased it:
 SYSTEM
   Mailbox:          you@example.com
   Model:            claude-opus-5   (simple questions -> claude-sonnet-5)
-  Running for:      4.2 days
+  Recording since:  2026-08-12  (16.4 days across 7 starts)
+  This run:         4.2 days   (stopped for 3.1 hours in total)
   People allowed:   5   (may send files: 4)
-  Default limit:    25 msg/day
+  Default limit:    30 msg/day
   Custom limits:    2 set
   Send caps:        30/hour, 150/day  (used today: 7)
   This month:       £10.98 across 1,300,000 in / 290,000 out tokens, 15 searches
@@ -192,6 +193,30 @@ asks for them — they would otherwise bury the monthly figures that matter.
 
 Tables are sent as both plain text and HTML, so columns stay aligned in clients
 that would otherwise reflow them.
+
+### Surviving a restart
+
+Everything counted — tokens, cost, per-person tallies, memory, the allowlist —
+lives in `state.json` in the mounted `data/` directory, not in the running
+process. A power cut, a reboot or a container restart does not reset any of it.
+
+- **`Recording since`** is written once, the first time the bot ever runs, and
+  carried forward from then on. Totals read as "since you set this up", not
+  "since the last restart".
+- **Time spent stopped is measured and shown**, because every save stamps the
+  clock and startup compares it to the present.
+- **State is written after every message**, so a power cut loses at most the one
+  in flight rather than the whole batch.
+- **Mail that arrived while it was down is still answered.** Scanning resumes
+  from the last message ID it handled, not from unread flags.
+- **Writes are atomic** — a temporary file replaced into place — so a cut
+  mid-write cannot leave a corrupt state file.
+
+The one thing genuinely lost during downtime is the API usage of messages it
+never processed, which is to say nothing was spent, so there is nothing to
+count.
+
+Back up `data/state.json` if the history matters to you.
 
 ### Memory
 
@@ -300,7 +325,7 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `TRIVIAL_MODEL` / `TRIVIAL_MAX_CHARS` | | Cheapest tier for very short questions |
 | `SIMPLE_MODEL` / `SIMPLE_MAX_CHARS` | | Middle tier for short questions |
 | `MAX_SENDS_PER_HOUR` / `MAX_SENDS_PER_DAY` | | Send caps |
-| `PER_USER_DAILY_LIMIT` | | Replies per person per day; admins exempt |
+| `PER_USER_DAILY_LIMIT` | | Replies per person per day, default 30; admins exempt |
 | `WEEKLY_REPORT_DAYS` / `MONTHLY_REPORT` / `YEARLY_REPORT` | | Scheduled summaries; `0` disables |
 | `USD_TO_GBP` / `CURRENCY_SYMBOL` | | Currency for reports |
 | `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` | | Remembering people between emails |

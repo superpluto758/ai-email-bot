@@ -150,6 +150,11 @@ def load_state():
         "last_heartbeat": 0,
         "limit_notified": {},
         "last_uid": 0,
+        "recording_since": None,  # first ever start - never reset
+        "last_start": 0,          # when this run began
+        "last_active": 0,         # last time state was written; reveals downtime
+        "starts": 0,              # how many times the bot has been started
+        "downtime": 0.0,          # total seconds spent stopped, cumulative
     }
     try:
         with open(STATE_PATH) as fh:
@@ -169,6 +174,8 @@ def load_state():
 def save_state(state):
     state["seen_ids"] = state["seen_ids"][-MAX_SEEN_IDS:]
     now = time.time()
+    # Stamped on every write so the next startup can see how long it was down.
+    state["last_active"] = now
     state["sent_times"] = [t for t in state.get("sent_times", []) if t > now - 86400]
 
     # Keep only the last 30 days of per-user activity, and drop users who have
@@ -342,7 +349,7 @@ MAX_ATTACHMENTS = 5
 MAX_SEND_ATTEMPTS = 3
 # Per-user daily reply limit. Admins are always unlimited. Individual people
 # can be given their own limit by email; those overrides live in the state file.
-PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "25"))
+PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "30"))
 
 # Scheduled reports to the owners: a weekly summary (which doubles as the
 # heartbeat) and a full summary when a month rolls over. "0" disables either.
@@ -905,14 +912,19 @@ def full_analytics(state, only=None):
     phrased. `only` narrows the per-person table to specific addresses."""
     month = datetime.now().strftime("%Y-%m")
     spend = (state.get("spend") or {}).get(month, {})
-    started = state.get("started_at")
-    if not started:
-        uptime = "unknown"
+    now = time.time()
+    since = state.get("recording_since") or state.get("started_at")
+    if since:
+        recording = "%s  (%s across %d start%s)" % (
+            datetime.fromtimestamp(since).strftime("%Y-%m-%d"),
+            human_duration(now - since), state.get("starts", 1),
+            "" if state.get("starts", 1) == 1 else "s")
     else:
-        mins = (time.time() - started) / 60
-        uptime = ("%.0f minutes" % mins if mins < 90 else
-                  "%.1f hours" % (mins / 60) if mins < 48 * 60 else
-                  "%.1f days" % (mins / 1440))
+        recording = "unknown"
+    uptime = human_duration(now - (state.get("last_start") or now))
+    down = state.get("downtime") or 0
+    if down > 60:
+        uptime += "   (stopped for %s in total)" % human_duration(down)
     limits = state.get("per_user_limits") or {}
 
     return "\n".join([
@@ -920,7 +932,8 @@ def full_analytics(state, only=None):
         "  Mailbox:          %s" % SELF,
         "  Model:            %s   (simple questions -> %s)"
         % (state.get("model"), SIMPLE_MODEL or "same"),
-        "  Running for:      %s" % uptime,
+        "  Recording since:  %s" % recording,
+        "  This run:         %s" % uptime,
         "  People allowed:   %d   (may send files: %d)"
         % (len(state.get("allowlist", [])), len(state.get("file_allowlist", []))),
         "  Default limit:    %s"
@@ -944,6 +957,16 @@ def full_analytics(state, only=None):
         "SPEND BY MONTH",
         spend_report(state),
     ])
+
+
+def human_duration(seconds):
+    """A rough, readable length of time - minutes, hours or days."""
+    mins = max(0.0, seconds) / 60
+    if mins < 90:
+        return "%.0f minutes" % mins
+    if mins < 48 * 60:
+        return "%.1f hours" % (mins / 60)
+    return "%.1f days" % (mins / 1440)
 
 
 def user_daily_limit(state, addr):
@@ -1909,6 +1932,12 @@ def process_unseen(server, state):
                 except Exception as exc:
                     log.error("policy alert failed: %s", exc)
 
+            # Write after each message rather than once per batch: a power cut
+            # mid-batch would otherwise lose the spend already incurred and
+            # replay messages that were already answered.
+            save_state(state)
+            dirty = False
+
         except Exception as exc:
             log.exception("uid %s failed to process - skipping it", uid)
             dirty = True
@@ -1948,9 +1977,33 @@ def main():
         sys.exit(1)
 
     state = load_state()
-    state.setdefault("started_at", time.time())
-    log.info("AI email answerer starting - mailbox=%s via %s | model=%s | allowlist=%d",
-             SELF, IMAP_HOST, state["model"], len(state["allowlist"]))
+    now = time.time()
+    # recording_since is written once and then carried forward for the life of
+    # the mailbox, so totals read as "since the day I set this up" rather than
+    # "since the last restart". An older state file inherits its started_at.
+    if not state.get("recording_since"):
+        state["recording_since"] = state.get("started_at") or now
+    state["starts"] = (state.get("starts") or 0) + 1
+    state["last_start"] = now
+
+    # A gap between the last write and now is time the bot was not running.
+    # Nothing already counted is lost - the totals live in this file - and mail
+    # that arrived meanwhile is still picked up, because scanning resumes from
+    # the last UID rather than from unread flags.
+    gap = now - (state.get("last_active") or now)
+    if gap > 120:
+        state["downtime"] = (state.get("downtime") or 0) + gap
+        log.info("was stopped for %s - counters continue from where they left "
+                 "off, and any mail that arrived meanwhile will be answered",
+                 human_duration(gap))
+    # Written straight away, so the clock survives even if no mail ever arrives.
+    save_state(state)
+
+    log.info("AI email answerer starting - mailbox=%s via %s | model=%s | "
+             "allowlist=%d | recording since %s (start #%d)",
+             SELF, IMAP_HOST, state["model"], len(state["allowlist"]),
+             datetime.fromtimestamp(state["recording_since"]).strftime("%Y-%m-%d"),
+             state["starts"])
 
     backoff = 5
     auth_failures = 0

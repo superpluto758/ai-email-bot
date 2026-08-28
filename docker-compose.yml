@@ -76,9 +76,10 @@ services:
       REPLY_DELAY_MAX: "20"
 
       # ---- limits, reports and analytics ----------------------------------
-      # Replies per person per day. Admins are always unlimited. Individual
-      # people can be given their own limit by email.
-      PER_USER_DAILY_LIMIT: "25"
+      # Replies per person per day for everyone who is not an owner. Admins
+      # are always unlimited. Individual people can be given their own limit
+      # by email; "0" means no limit for anyone.
+      PER_USER_DAILY_LIMIT: "30"
 
       # Scheduled summaries to the alert addresses. The weekly one doubles as a
       # heartbeat: if it stops arriving, the bot or its machine is down.
