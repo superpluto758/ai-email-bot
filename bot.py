@@ -20,7 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from email.header import decode_header, make_header
+from email.header import decode_header
 from email.message import EmailMessage
 from datetime import datetime
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
@@ -108,12 +108,23 @@ BOT_MARKER = "\u2014 AI assistant"
 FLAG_PREFIX = "[AI Flag]"
 
 API_URL = "https://api.anthropic.com/v1/messages"
+# Returned when the model produces no text at all. Distinct from None, which
+# means the call failed and is worth retrying.
+EMPTY_ANSWER = ("I wasn't able to put together an answer to that one, sorry - "
+                "it may have been too long or too involved. Try asking it in a "
+                "shorter or more specific way and I'll have another go.")
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.example.com")
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.example.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 FROM_NAME = os.environ.get("FROM_NAME", "AI Assistant")
+IMAP_TIMEOUT = 120          # seconds; must exceed nothing but a stalled socket
 IDLE_REFRESH = 240          # re-arm IDLE every 4 min; some servers drop it at 29
 MAX_SEEN_IDS = 3000
+# Fetching every waiting message at once pulls full bodies and attachments into
+# memory in one go. After a long outage that is gigabytes on a NAS sharing RAM
+# with other containers, and the OOM kill just restarts the same fetch.
+MAX_BATCH = 40
+MAX_HELD = 200              # deferred messages remembered across scans
 
 # Abuse-safety limits. Repeatedly retrying a rejected login looks exactly like
 # credential stuffing to a mail provider and can get the account suspended, so
@@ -128,6 +139,9 @@ AUTH_ERROR_MARKERS = ("authenticationfailed", "invalid credentials",
                       "login failed", "authentication failed",
                       "web login required", "application-specific password")
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+# Addresses anywhere inside a block of text, used to check that an admin really
+# typed the address they are said to be acting on.
+ADDRESS_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 # Senders the assistant ignores completely. Their mail is never read by the
 # model, never classified, never answered, never counted and never labelled -
@@ -166,6 +180,8 @@ def load_state():
         "last_heartbeat": 0,
         "limit_notified": {},
         "last_uid": 0,
+        "held_uids": [],          # deferred messages, re-checked every scan
+        "uidvalidity": 0,         # the server's UID generation; a change resets us
         "recording_since": None,  # first ever start - never reset
         "last_start": 0,          # when this run began
         "last_active": 0,         # last time state was written; reveals downtime
@@ -183,7 +199,20 @@ def load_state():
         state["added_at"] = {normalize(a): now for a in DEFAULT_ALLOWLIST}
         log.info("no state file yet - starting fresh from defaults")
     except Exception as exc:
-        log.warning("state file unreadable (%s) - using defaults", exc)
+        # Do NOT quietly carry on with defaults: that silently empties the
+        # allowlist, the file allowlist, the memory and every counter, and the
+        # next save overwrites the only copy. Keep the damaged file for the
+        # owner and refuse to start, so a bad read cannot become a bad write.
+        keep = "%s.corrupt.%d" % (STATE_PATH, int(time.time()))
+        try:
+            os.replace(STATE_PATH, keep)
+            log.error("state file unreadable (%s) - kept a copy at %s", exc, keep)
+        except OSError:
+            log.error("state file unreadable (%s) and could not be moved", exc)
+        log.error("refusing to start on defaults, because that would silently "
+                  "reset the allowlist and every counter. Restore the file, or "
+                  "delete it deliberately to start fresh.")
+        sys.exit(1)
     return state
 
 
@@ -219,10 +248,26 @@ def save_state(state):
     directory = os.path.dirname(STATE_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
+    # os.replace is atomic for the directory entry, not for the data behind
+    # it. Without fsync a power cut on the NAS routinely leaves a zero-length
+    # or truncated file - which load_state then treats as "no state", resetting
+    # every permission list. The pid suffix keeps the SIGTERM handler from
+    # writing into the same temp file as an interrupted save.
+    tmp = "%s.%d.tmp" % (STATE_PATH, os.getpid())
     with open(tmp, "w") as fh:
         json.dump(state, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, STATE_PATH)
+    try:
+        dir_fd = os.open(os.path.dirname(STATE_PATH) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)          # make the rename itself durable
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass                          # some filesystems refuse this; the data
+                                      # write above is the part that matters
 
 
 # ------------------------------------------------------------- addresses ---
@@ -254,28 +299,78 @@ def header(msg, name):
     if not raw:
         return ""
     try:
-        return str(make_header(decode_header(raw)))
+        out = []
+        for chunk, charset in decode_header(raw):
+            if isinstance(chunk, bytes):
+                # compat32 labels raw 8-bit as "unknown-8bit"; make_header then
+                # decodes it as ASCII-with-replace and the bytes are lost, so a
+                # Spanish or Russian subject came back as question marks.
+                out.append(decode_bytes(chunk, charset))
+            else:
+                out.append(chunk)
+        return "".join(out).strip()
     except Exception:
         return str(raw)
 
 
 # Charsets to try, in order, when a message lies about its encoding or omits it.
+# Codecs that will happily decode Latin text into CJK gibberish, and the block
+# of characters that tells us a CJK guess was actually right.
+CJK_CHARSETS = ("gb18030", "big5", "shift_jis", "euc-jp", "euc-kr")
+CJK_RANGE_START, CJK_RANGE_END = 0x2E80, 0xD7FF
+CJK_MIN_SHARE = 0.3
+
+# Order matters: every single-byte codec below "succeeds" on any bytes at all,
+# so the first one tried wins. They are listed by how likely they are for this
+# mailbox's correspondents - Western European first. Arabic and Hebrew last,
+# because putting them earlier turned German umlauts into Arabic diacritics.
 CHARSET_FALLBACKS = ("utf-8", "gb18030", "big5", "shift_jis", "euc-jp", "euc-kr",
-                     "windows-1256", "windows-1255", "windows-1251", "windows-1252",
-                     "iso-8859-2", "koi8-r", "latin-1")
+                     "windows-1252", "latin-1", "iso-8859-2",
+                     "windows-1251", "koi8-r", "windows-1256", "windows-1255")
 
 
-def decode_payload(part):
-    """Decode a MIME part to text, trying its declared charset then common ones.
+def decode_bytes(raw, declared=None):
+    """Turn bytes into text, trying the declared charset then common ones.
 
     Real-world mail frequently declares the wrong charset or none at all, which
     matters most for non-Latin scripts, so we try a list before giving up and
-    replacing bad bytes."""
-    raw = part.get_payload(decode=True)
+    replacing bad bytes. "unknown-8bit" is what compat32 calls a raw 8-bit
+    header - it is a label, not a codec, so it must not be tried."""
     if not raw:
         return ""
-    declared = part.get_content_charset()
-    for charset in ([declared] if declared else []) + list(CHARSET_FALLBACKS):
+    if declared and declared.lower() in ("unknown-8bit", "x-unknown", "unknown"):
+        declared = None
+    if declared:
+        try:
+            return raw.decode(declared)
+        except (UnicodeDecodeError, LookupError, TypeError):
+            pass
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # The CJK codecs below accept a lot of Latin-1 text and turn it into
+    # plausible-looking nonsense ("Frage \u9edaer K\u9d08ln"), so only take one
+    # when the result actually contains CJK - otherwise a German subject would
+    # be silently rendered as Chinese.
+    for charset in CJK_CHARSETS:
+        try:
+            text = raw.decode(charset)
+        except (UnicodeDecodeError, LookupError, TypeError):
+            continue
+        dense = [ch for ch in text if not ch.isspace()]
+        cjk = sum(1 for ch in dense if CJK_RANGE_START <= ord(ch) <= CJK_RANGE_END)
+        # Latin-1 text run through a CJK codec produces a few stray ideographs
+        # among ASCII words ("Frage \u9edaer K\u9d08ln" - 2 of 13). Genuine CJK
+        # text is mostly ideographs, so a share test separates the two where a
+        # simple "contains CJK" test cannot.
+        if dense and cjk / len(dense) >= CJK_MIN_SHARE:
+            return text
+    # The CJK codecs were already offered above and turned down, so they must
+    # not reappear here - otherwise the rejection is immediately undone.
+    for charset in CHARSET_FALLBACKS:
+        if charset in CJK_CHARSETS:
+            continue
         try:
             return raw.decode(charset)
         except (UnicodeDecodeError, LookupError, TypeError):
@@ -283,7 +378,14 @@ def decode_payload(part):
     return raw.decode("utf-8", "replace")
 
 
+def decode_payload(part):
+    """Decode a MIME part to text using its declared charset where possible."""
+    return decode_bytes(part.get_payload(decode=True), part.get_content_charset())
+
+
 def body_text(msg, limit=8000):
+    if not msg.is_multipart() and msg.get_content_maintype() != "text":
+        return ""          # a bare PDF or image is not the message's text
     parts = []
     if msg.is_multipart():
         for part in msg.walk():
@@ -349,6 +451,21 @@ AUTO_SENDER_RE = re.compile(
 DMARC_SUBJECT_RE = re.compile(r"^\s*report domain\s*:", re.I)
 
 
+# An auto-responder announcing itself: "Automatic reply: ...", "Auto-Reply: ...".
+AUTO_SUBJECT_RE = re.compile(
+    r"^\s*(auto(matic)?[\s._-]*(reply|response|responder|antwort|antwoord)"
+    r"|automatische[\s-]*antwort|r\u00e9ponse[\s-]*automatique"
+    r"|\u81ea\u52d5\u8fd4\u4fe1|\u81ea\u52a8\u56de\u590d)", re.I)
+
+# "Out of office" and friends are only a signal when they ARE the whole subject.
+# A person writing "Out of office next week - can we move the meeting?" is
+# asking a question, and the old rule threw it away without a trace.
+OOO_SUBJECT_RE = re.compile(
+    r"^\s*(out of (the )?office|ooo|abwesenheit|away from (the )?office|"
+    r"on (annual )?leave|on holiday|on vacation)"
+    r"[\s\-\u2013:,.!]*(auto[\s-]*reply|reply|notification)?[\s\-\u2013:,.!]*$", re.I)
+
+
 def is_automated(msg, sender):
     if AUTO_SENDER_RE.search(sender or ""):
         return True
@@ -361,7 +478,13 @@ def is_automated(msg, sender):
         return True
     if msg.get("List-Unsubscribe"):
         return True
-    if re.match(r"^\s*(auto|automatic|out of office|ooo)\b", header(msg, "Subject"), re.I):
+    # Match how auto-responders actually phrase themselves. The old rule was
+    # "^auto" and swallowed "Auto insurance renewal - is this a good deal?" and
+    # "Auto-correct keeps changing my name" without a trace. Genuine
+    # auto-responders are already caught above by Auto-Submitted and
+    # Precedence, so this can afford to be strict.
+    subject = header(msg, "Subject")
+    if AUTO_SUBJECT_RE.match(subject) or OOO_SUBJECT_RE.match(subject):
         return True
     return False
 
@@ -403,6 +526,7 @@ MEMORY_MAX_CHARS = int(os.environ.get("MEMORY_MAX_CHARS", "1200"))
 
 # USD per million tokens, for the spend report. Update if pricing changes.
 PRICES = {
+    "claude-fable-5":  (10.0, 50.0),
     "claude-opus-5":   (5.0, 25.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-haiku-4-5": (1.0, 5.0),
@@ -431,20 +555,51 @@ MAX_TRACKED_USERS = 500
 MAX_TIMES_PER_USER = 5000     # a very busy sender cannot bloat the state file
 
 
+# A logo in someone's signature is not "sending a file". Mail clients attach
+# them as ordinary parts, complete with filenames, so without this every
+# Outlook user with a branded signature had their plain text mail declined
+# unread - and told, untruthfully, that they had attached something.
+SIGNATURE_MAX_BYTES = 80 * 1024
+
+
+def is_decoration(part, ctype, disposition, data):
+    """True for an image that is part of the message's furniture, not its point.
+
+    Deliberately narrow: only images, only small ones, and only where the
+    sender's client did not mark them as a real attachment. A pasted screenshot
+    is bigger than this and still counts as a file, so this cannot be used to
+    smuggle content past the file permission."""
+    if ctype not in IMAGE_TYPES:
+        return False
+    if "attachment" in (disposition or "").lower():
+        return False
+    if len(data) >= SIGNATURE_MAX_BYTES:
+        return False
+    # Everything that reaches here is a small image the sender's client added
+    # without marking it as an attachment: a signature logo, a social icon, a
+    # tracking pixel, a quoted logo travelling down a thread.
+    return True
+
+
 def extract_attachments(msg):
     """Return (content blocks Claude can read, names of ones it can't)."""
     blocks, unreadable, total = [], [], 0
-    if not msg.is_multipart():
+    # A single-part message can still BE an attachment - scan-to-email from a
+    # copier arrives as a bare application/pdf with no multipart wrapper. It
+    # used to be invisible here and then decoded as if it were the question.
+    parts = [msg] if not msg.is_multipart() else list(msg.walk())
+    if not msg.is_multipart() and msg.get_content_maintype() == "text":
         return blocks, unreadable
 
-    for part in msg.walk():
+    for part in parts:
         if part.get_content_maintype() == "multipart":
             continue
         filename = part.get_filename()
         ctype = (part.get_content_type() or "").lower()
         disposition = str(part.get("Content-Disposition", ""))
-        # A real attachment, or an inline image pasted into the message body.
-        if not filename and "attachment" not in disposition:
+        # A real attachment, an inline image pasted into the body, or a whole
+        # message that is itself a single non-text part.
+        if not filename and "attachment" not in disposition and part is not msg:
             if not (ctype in IMAGE_TYPES and "inline" in disposition):
                 continue
         if ctype == "message/rfc822":
@@ -468,6 +623,11 @@ def extract_attachments(msg):
         except Exception:
             continue
         if not data:
+            continue
+
+        if is_decoration(part, ctype, disposition, data):
+            log.debug("ignoring %s (%d bytes) - looks like signature decoration",
+                      filename or ctype, len(data))
             continue
 
         name = filename or ("pasted image" if ctype in IMAGE_TYPES else "file")
@@ -598,7 +758,14 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
     # Web search wraps quoted sources in <cite> tags. Those are meant for a UI
     # that renders them; in a plain-text email they are just noise.
     text = re.sub(r"</?cite[^>]*>", "", text)
-    return text.strip() or None
+    if text.strip():
+        return text.strip()
+    # No text came back. That is not the same as a failed call - the tokens were
+    # spent - and retrying it re-runs the whole (billed) search from scratch, so
+    # say what happened rather than looping.
+    log.warning("model returned no text (stop_reason=%s) - not retrying",
+                data.get("stop_reason"))
+    return EMPTY_ANSWER
 
 
 def guardrails():
@@ -689,9 +856,24 @@ def send_mail(to_addrs, subject, body, in_reply_to=None, references=None):
     msg.set_content(body, charset="utf-8")
     msg.add_alternative(_html_version(body), subtype="html", charset="utf-8")
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=90) as smtp:
+    # Deliberately not a "with" block. SMTP.__exit__ sends QUIT and raises on any
+    # non-221 reply - which happens AFTER the message has been accepted. Treating
+    # that as a failed send requeued the message and sent the answer again, up to
+    # three times. Once send_message returns, the mail is away; nothing that
+    # happens while hanging up can change that.
+    smtp = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=90)
+    try:
         smtp.login(SELF, APP_PASSWORD)
         smtp.send_message(msg)
+    finally:
+        try:
+            smtp.quit()
+        except Exception as exc:
+            log.debug("untidy SMTP hangup after a successful send: %s", exc)
+            try:
+                smtp.close()
+            except Exception:
+                pass
     log.info("sent %r to %s", subject[:60], ", ".join(to_addrs))
 
 
@@ -766,6 +948,21 @@ def user_tally(state, addr, month=None):
             .setdefault(normalize(addr),
                         {"msgs_in": 0, "msgs_out": 0, "in": 0, "out": 0,
                          "searches": 0, "usd": 0.0}))
+
+
+def record_last_call(state, sender=None):
+    """Record whatever the most recent API call cost.
+
+    Every path that calls the model has to reach this, not just the one that
+    ends in a reply. Triage of strangers, refused generations and abandoned
+    retries all cost real money, and for a long time none of them appeared in
+    any report."""
+    try:
+        record_spend(state, LAST_CALL.get("model") or state.get("model"),
+                     LAST_CALL.get("usage"), LAST_CALL.get("searches", 0), sender)
+    except Exception as exc:
+        log.error("could not record spend for %s: %s", sender or "?", exc)
+    LAST_CALL.clear()
 
 
 def record_spend(state, model, usage, searches=0, sender=None):
@@ -949,13 +1146,13 @@ def cost_by_user(state, month=None, only=None):
     return "\n".join(out)
 
 
-def full_analytics(state, only=None):
+def full_analytics(state, only=None, month=None):
     """Everything an owner might want, in one reply.
 
     Every analytics request returns this same shape - the system block and the
     per-person table - so the answer never depends on how the question was
     phrased. `only` narrows the per-person table to specific addresses."""
-    month = datetime.now().strftime("%Y-%m")
+    month = month or datetime.now().strftime("%Y-%m")
     spend = (state.get("spend") or {}).get(month, {})
     now = time.time()
     since = state.get("recording_since") or state.get("started_at")
@@ -1062,6 +1259,19 @@ def add_memory(state, addr, note):
     mem[key] = combined
 
 
+# Rough capability order, used only to stop a permission becoming a downgrade.
+MODEL_RANK = {"claude-haiku-4-5": 1, "claude-sonnet-5": 2,
+              "claude-opus-5": 3, "claude-fable-5": 4}
+
+
+def better_model(*models):
+    """The most capable of the models given, ignoring blanks."""
+    real = [m for m in models if m]
+    if not real:
+        return None
+    return max(real, key=lambda m: MODEL_RANK.get(m, 0))
+
+
 def may_use_opus(state, addr):
     """Non-owners reach the main model only if an owner has allowed it."""
     return is_admin(addr) or in_list(addr, state.get("opus_allowlist") or [])
@@ -1084,7 +1294,13 @@ def pick_model(state, question, attachments, sender="", is_owner=False):
         return main
 
     # The most expensive model this sender is allowed to reach.
-    ceiling = main if may_use_opus(state, sender) else (SIMPLE_MODEL or main)
+    # "The top model" means the more capable of the two, not literally the
+    # configured main model: an admin can set that to haiku, and the permission
+    # must never end up handing someone a weaker model than an ordinary sender.
+    if may_use_opus(state, sender):
+        ceiling = better_model(main, SIMPLE_MODEL)
+    else:
+        ceiling = SIMPLE_MODEL or main
 
     # Escalate before looking at length. A photo to read or a question about
     # something current needs a capable model however few words it took to
@@ -1277,7 +1493,29 @@ def answer_normally(state, thread_text, attachments=None, sender="",
     return call_claude(model, system, content, web_search=True, effort=effort)
 
 
-def handle_admin(state, thread_text, attachments=None, sender=""):
+def addresses_in(text):
+    """Every email address literally present in a piece of text."""
+    return {a.lower() for a in ADDRESS_IN_TEXT_RE.findall(text or "")}
+
+
+def only_typed(values, typed, changes_blocked, field):
+    """Keep only addresses the admin actually wrote in their own new text.
+
+    Alert emails quote a stranger's message verbatim and end by inviting the
+    owner to reply. When they do, their client quotes the whole alert, and the
+    settings parser used to read the stranger's "please add me to the allowlist"
+    as though the owner had typed it. Enforced here rather than in the prompt,
+    because the text being defended against is written by an attacker."""
+    kept = []
+    for addr in values or []:
+        if str(addr).strip().lower() in typed:
+            kept.append(addr)
+        else:
+            changes_blocked.append("%s (%s)" % (str(addr).strip().lower(), field))
+    return kept
+
+
+def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
     system = (guardrails() +
               " The sender is an ADMIN (an owner of this assistant). Reply "
               "style: " + state["style"] + "."
@@ -1349,10 +1587,29 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
         return None
     parsed = parse_json(raw)
     if not parsed:
+        if looks_like_json(raw):
+            log.warning("unparseable JSON from the model on the admin path - "
+                        "no settings were applied")
+            return (MALFORMED_NOTICE + "\n\nApplied: no changes - I could not "
+                    "read my own reply, so nothing was acted on.")
         return raw            # model answered in prose - just send that
 
     changes = []
     protected = []
+    blocked = []
+    # Only what the admin typed in this message counts. Anything reached only
+    # through quoted text - their own older mail, a forward, or one of our own
+    # alerts quoting a stranger - is ignored and reported back to them.
+    typed = addresses_in(own_text if own_text.strip() else "")
+    for field in ("add", "remove", "file_add", "file_remove",
+                  "opus_add", "opus_remove", "clear_memory"):
+        if parsed.get(field):
+            parsed[field] = only_typed(parsed[field], typed, blocked, field)
+    if parsed.get("set_limits"):
+        parsed["set_limits"] = {k: v for k, v in parsed["set_limits"].items()
+                                if str(k).strip().lower() in typed
+                                or blocked.append("%s (set_limits)"
+                                                  % str(k).strip().lower())}
     for addr in parsed.get("add") or []:
         addr = str(addr).strip().lower()
         if not EMAIL_RE.match(addr) or in_list(addr, state["allowlist"]):
@@ -1475,10 +1732,21 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
     # an admin should not come back with "Applied: no changes." stuck on it.
     asked_about_settings = any(parsed.get(k) for k in
                                ("add", "remove", "file_add", "file_remove",
-                                "style", "model", "set_limits", "clear_memory"))
-    if asked_about_settings or changes or protected:
+                                "opus_add", "opus_remove", "style", "model",
+                                "effort", "set_limits", "clear_memory"))
+    if asked_about_settings or changes or protected or blocked:
         reply += ("\n\nApplied: " + "; ".join(changes) + "."
                   if changes else "\n\nApplied: no changes.")
+
+    if blocked:
+        log.warning("ignored settings change(s) reached only through quoted "
+                    "text: %s", ", ".join(sorted(set(blocked))))
+        reply += ("\n\n(Note: %s appeared only in quoted text, not in anything "
+                  "you typed in this message, so nothing was done about them. "
+                  "Quoted text is never treated as an instruction - it can carry "
+                  "someone else's words, including a stranger's quoted back to "
+                  "you in an alert. Type the address yourself if you did mean it.)"
+                  % ", ".join(sorted({x.split(" (")[0] for x in blocked})))
 
     if protected:
         log.info("refused to change admin address(es): %s", ", ".join(protected))
@@ -1488,6 +1756,19 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
                   "That can only be changed in the bot's configuration.)"
                   % ", ".join(sorted(set(protected))))
     return reply
+
+
+def looks_like_json(text):
+    """Does this look like a JSON envelope we failed to parse, or real prose?"""
+    t = (text or "").lstrip().lstrip("`json").lstrip()
+    return t.startswith("{") or '"reply"' in t[:400] or '"category"' in t[:400]
+
+
+MALFORMED_NOTICE = (
+    "Sorry - something went wrong putting my answer together and I would "
+    "rather send you this than something garbled.\n\n"
+    "Please send your question again. If it was a long one, breaking it into "
+    "two shorter messages usually helps.")
 
 
 BLOCKED_NOTICE = (
@@ -1506,7 +1787,23 @@ def apply_policy(raw, sender, from_header, subject, received):
         return None, []
     parsed = parse_json(raw)
     if not parsed or not parsed.get("reply"):
-        return raw, []            # prose fallback; it was written under the policy
+        if looks_like_json(raw):
+            # Never post a half-parsed envelope to the sender. The documented
+            # field order puts "reply" last, so the part that survives
+            # truncation is the owner's-log reason and the policy flags - the
+            # exact things the policy promises the sender never sees.
+            log.warning("unparseable JSON from the model for %s - sending a "
+                        "plain apology instead", sender)
+            return MALFORMED_NOTICE, [{
+                "addr": sender, "sender": from_header, "subject": subject,
+                "date": received.isoformat() if received else "unknown",
+                "category": "internal", "action": "sent an apology instead",
+                "reason": "the model's reply could not be parsed, so it was "
+                          "withheld rather than sent raw",
+                "footer": "Nothing was leaked to them. Worth a look if it "
+                          "repeats - it usually means the answer was truncated.",
+            }]
+        return raw, []            # genuine prose; it was written under the policy
 
     category = str(parsed.get("category") or "normal").lower()
     reply = parsed["reply"]
@@ -1663,8 +1960,13 @@ def send_flag_alerts(flagged):
 # ------------------------------------------------------------ processing ---
 
 def _report_body(state, heading, month, note):
-    """Scheduled reports use exactly the same layout as an on-demand one."""
-    return "%s\n\n%s\n\n%s" % (heading, full_analytics(state), note)
+    """Scheduled reports use exactly the same layout as an on-demand one.
+
+    `month` is load-bearing: the monthly summary fires on the first wake-up
+    AFTER the month rolls over, so reporting "now" gave it a brand-new month
+    with nothing in it - a month-end summary headed "July" showing zero of
+    everything, because it was really showing August."""
+    return "%s\n\n%s\n\n%s" % (heading, full_analytics(state, month=month), note)
 
 
 def maybe_reports(state):
@@ -1675,6 +1977,7 @@ def maybe_reports(state):
     if not notify_admins():
         return
     now = time.time()
+    dirty = False
     this_month = datetime.now().strftime("%Y-%m")
 
     # --- monthly, on the first run after the month rolls over ---------------
@@ -1682,6 +1985,7 @@ def maybe_reports(state):
     if MONTHLY_REPORT:
         if not last_month_sent:
             state["last_monthly_month"] = this_month       # start the clock
+            dirty = True
         elif last_month_sent != this_month:
             try:
                 send_mail(notify_admins(),
@@ -1693,10 +1997,14 @@ def maybe_reports(state):
                                        "from published per-token prices."
                                        % last_month_sent))
                 record_send(state)
-                state["last_monthly_month"] = this_month
                 log.info("monthly summary sent for %s", last_month_sent)
             except Exception as exc:
                 log.error("monthly summary failed: %s", exc)
+            # Advance regardless. This runs every four minutes, and a broken
+            # SMTP login would otherwise retry ~360 times a day forever - the
+            # exact hammering the auth-failure halt exists to prevent.
+            state["last_monthly_month"] = this_month
+            dirty = True
 
     # --- yearly, cost only, on the first run after the year turns over ------
     this_year = datetime.now().strftime("%Y")
@@ -1704,6 +2012,7 @@ def maybe_reports(state):
     if YEARLY_REPORT:
         if not last_year_sent:
             state["last_yearly_year"] = this_year
+            dirty = True
         elif last_year_sent != this_year:
             try:
                 send_mail(notify_admins(),
@@ -1713,19 +2022,25 @@ def maybe_reports(state):
                           "figures, ask the assistant for the analytics."
                           % (last_year_sent, yearly_cost_report(state, last_year_sent)))
                 record_send(state)
-                state["last_yearly_year"] = this_year
                 log.info("yearly cost summary sent for %s", last_year_sent)
             except Exception as exc:
                 log.error("yearly summary failed: %s", exc)
+            state["last_yearly_year"] = this_year
+            dirty = True
 
     # --- weekly -------------------------------------------------------------
     if WEEKLY_REPORT_DAYS <= 0:
+        if dirty:
+            save_state(state)
         return
     last = state.get("last_heartbeat") or 0
     if not last:
         state["last_heartbeat"] = now                      # start the clock
+        save_state(state)
         return
     if now - last < WEEKLY_REPORT_DAYS * 86400:
+        if dirty:
+            save_state(state)
         return
     try:
         send_mail(notify_admins(),
@@ -1736,10 +2051,14 @@ def maybe_reports(state):
                                "the bot has died or the machine it runs on is "
                                "offline - worth checking." % WEEKLY_REPORT_DAYS))
         record_send(state)
-        state["last_heartbeat"] = now
         log.info("weekly summary sent")
     except Exception as exc:
         log.error("weekly summary failed: %s", exc)
+    # Stamped either way: a failure must not turn into a four-minute retry loop.
+    state["last_heartbeat"] = now
+    # Persisted here rather than left in memory, so an ungraceful restart does
+    # not re-send every summary the moment it comes back.
+    save_state(state)
 
 
 def process_unseen(server, state):
@@ -1749,11 +2068,25 @@ def process_unseen(server, state):
     what has already opened a message - if you read an email before the bot
     got to it, it still gets answered."""
     last = state.get("last_uid") or 0
+    held = [int(u) for u in (state.get("held_uids") or [])]
+    dirty_held = False
     try:
         if last:
             # "N:*" always returns at least the highest UID, so filter again.
             uids = [u for u in server.search(["UID", "%d:*" % (last + 1)])
                     if u > last]
+            # Messages deferred earlier sit BELOW the watermark, so they have to
+            # be asked for by name. Keeping them in explicit state rather than
+            # inferring them from the watermark is what makes a deferral
+            # survivable - the old scheme lost them outright on a first scan.
+            if held:
+                alive = set(server.search(["UID", ",".join(str(u) for u in held)]))
+                uids = sorted(set(uids) | {u for u in held if u in alive})
+                gone = [u for u in held if u not in alive]
+                if gone:
+                    log.info("%d held message(s) no longer in the mailbox", len(gone))
+                    state["held_uids"] = [u for u in held if u in alive]
+                    dirty_held = True
         else:
             # First run on this mailbox: take the unread mail, and set the
             # watermark to the top so an existing inbox is not answered in bulk.
@@ -1767,9 +2100,13 @@ def process_unseen(server, state):
     if not uids:
         return
 
+    if len(uids) > MAX_BATCH:
+        log.info("%d messages waiting - taking the oldest %d this pass",
+                 len(uids), MAX_BATCH)
+        uids = sorted(uids)[:MAX_BATCH]
     fetched = server.fetch(uids, ["RFC822", "INTERNALDATE"])
     flagged = []
-    dirty = False
+    dirty = dirty_held
     retry = set()      # UIDs deliberately left for a later pass
 
     for uid in uids:
@@ -1798,7 +2135,7 @@ def process_unseen(server, state):
             if (normalize(sender) == normalize(SELF)
                     or msg.get("X-AI-Bot")
                     or BOT_MARKER in own_text          # older replies, still quoted
-                    or subject.startswith(FLAG_PREFIX)):
+                    or FLAG_PREFIX in subject):
                 log.info("ignoring our own message from %s", sender)
                 state["seen_ids"].append(msg_id)
                 mark_seen(server, uid)
@@ -1826,6 +2163,10 @@ def process_unseen(server, state):
                     label(server, uid, LABEL_SKIPPED)
                     continue
                 verdict = classify_outsider(state, sender, subject, body) or {}
+                # Triage is billed like anything else, so it has to be recorded
+                # like anything else - it was the single biggest hole in the
+                # spend report, since every stranger who writes in costs one call.
+                record_last_call(state, sender)
                 if verdict.get("flag") == "red":
                     label(server, uid, LABEL_DENIED)
                     flagged.append({
@@ -1883,7 +2224,9 @@ def process_unseen(server, state):
                 day = datetime.now().strftime("%Y-%m-%d")
                 if already.get(normalize(sender)) != day:
                     # Once per person per day, so a chatty sender cannot spam you.
-                    already[normalize(sender)] = day
+                    # Stamped only after the send succeeds - stamping first meant
+                    # one transient SMTP hiccup silently cost the owners the
+                    # entire day's notice for that person.
                     try:
                         send_mail(notify_admins(),
                                   "%s daily limit reached - %s" % (FLAG_PREFIX, sender),
@@ -1899,8 +2242,28 @@ def process_unseen(server, state):
                                   % (sender, msg.get("From", sender), limit, used,
                                      subject or "(none)", sender))
                         record_send(state)
+                        already[normalize(sender)] = day
                     except Exception as exc:
                         log.error("limit alert failed: %s", exc)
+                # Tell them once a day, not once a message. The admin alert
+                # above was already throttled this way; the sender's notice was
+                # not, so a chatty sender over their limit generated an
+                # unbounded stream of identical automated mail to a real
+                # recipient - and pushed other people's genuine replies past
+                # the global cap.
+                told = state.setdefault("limit_told", {})
+                if told.get(normalize(sender)) == day:
+                    log.info("%s already told about their limit today", sender)
+                    label(server, uid, LABEL_SKIPPED)
+                    mark_seen(server, uid)
+                    continue
+                if over_send_limit(state):
+                    log.info("not sending %s a limit notice - global cap reached",
+                             sender)
+                    label(server, uid, LABEL_SKIPPED)
+                    mark_seen(server, uid)
+                    continue
+                told[normalize(sender)] = day
                 human_pause()
                 try:
                     send_mail([sender], reply_subject(subject, body),
@@ -1951,6 +2314,10 @@ def process_unseen(server, state):
                     retry.add(uid)
                     continue
                 record_send(state)
+                # Counts against their daily allowance like any other reply -
+                # otherwise the one limit designed to stop a repeating loop is
+                # unreachable on the path most likely to produce one.
+                record_reply_to(state, sender)
                 flagged.append({
                     "sender": msg.get("From", sender),
                     "addr": sender,
@@ -1992,23 +2359,33 @@ def process_unseen(server, state):
 
             policy_alerts = []
             if is_admin(sender):
-                reply = handle_admin(state, thread_text, attachments, sender)  # unfiltered
+                # own_text is what this person actually typed, with every
+                # quoted line stripped - the only text a settings change may
+                # come from.
+                reply = handle_admin(state, thread_text, attachments, sender,
+                                     own_text=own_text)  # unfiltered content-wise
             else:
                 raw_reply = answer_normally(state, thread_text, attachments, sender,
                                             question=own_text or subject)
-                note = (parse_json(raw_reply) or {}).get("memory") if raw_reply else None
-                if note:
-                    add_memory(state, sender, note)
                 reply, policy_alerts = apply_policy(
                     raw_reply, sender, msg.get("From", sender), subject, received)
                 for entry in policy_alerts:
                     log.info("content policy: %s from %s - %s",
                              entry["category"], sender, entry["action"])
+                # Only remember people from ordinary exchanges. Storing a note
+                # from a blocked or distressed message keeps that subject in
+                # the state file and feeds it back into their system prompt on
+                # every future email - the opposite of what the policy is for.
+                if not policy_alerts:
+                    note = (parse_json(raw_reply) or {}).get("memory") if raw_reply else None
+                    if note:
+                        add_memory(state, sender, note)
 
             if reply is None:
                 # The API would not answer. Usually transient, so retry - but
                 # cap it: a corrupt attachment fails identically every time,
                 # and each attempt is billed.
+                record_last_call(state, sender)   # a refused generation still cost
                 tries = state.setdefault("reply_failures", {})
                 tries[msg_id] = tries.get(msg_id, 0) + 1
                 if tries[msg_id] >= MAX_REPLY_ATTEMPTS:
@@ -2027,6 +2404,8 @@ def process_unseen(server, state):
                                     "most likely damaged in transit"
                                     % MAX_REPLY_ATTEMPTS),
                         "quote": "",
+                        "reason": "the model refused or failed to answer it "
+                                  "%d times running" % MAX_REPLY_ATTEMPTS,
                         "resolve": "ask them to resend it, ideally in a different "
                                    "format.",
                     })
@@ -2073,12 +2452,7 @@ def process_unseen(server, state):
             state.get("reply_failures", {}).pop(msg_id, None)
             record_send(state)
             record_reply_to(state, sender)
-            try:
-                record_spend(state, LAST_CALL.get("model", state["model"]),
-                             LAST_CALL.get("usage"), LAST_CALL.get("searches", 0),
-                             sender)
-            except Exception as exc:
-                log.error("could not record spend for %s: %s", sender, exc)
+            record_last_call(state, sender)
             for entry in policy_alerts:
                 try:
                     record_send(state)
@@ -2089,8 +2463,20 @@ def process_unseen(server, state):
             # Write after each message rather than once per batch: a power cut
             # mid-batch would otherwise lose the spend already incurred and
             # replay messages that were already answered.
-            save_state(state)
-            dirty = False
+            #
+            # Deliberately outside the per-message error handler. A full or
+            # read-only /data used to be caught below and reported to the
+            # owners as "this message could not be processed, so it was never
+            # answered" - for a message that HAD been answered - and then
+            # surfaced in main() as a connection problem, sending the bot into
+            # a reconnect loop over a disk fault.
+            try:
+                save_state(state)
+                dirty = False
+            except Exception as exc:
+                log.error("could not write state after answering %s: %s "
+                          "(the reply WAS sent)", sender, exc)
+                dirty = True
 
         except Exception as exc:
             log.exception("uid %s failed to process - skipping it", uid)
@@ -2103,6 +2489,10 @@ def process_unseen(server, state):
                 "summary": ("this message could not be processed because of an "
                             "internal error, so it was never answered: %s" % exc),
                 "quote": "",
+                "reason": "the assistant hit an internal error handling it",
+                "resolve": "this is a fault in the assistant, not in their "
+                           "message - the log has the traceback. Answer them "
+                           "yourself if it mattered.",
             })
             try:
                 label(server, uid, LABEL_SKIPPED)
@@ -2114,12 +2504,20 @@ def process_unseen(server, state):
     # re-fetched the whole backlog, and once seen_ids rolled past its cap the
     # oldest of those would have been answered a second time. Anything held
     # for a retry keeps the watermark behind it, so it is still picked up.
-    done = [u for u in uids if u not in retry]
-    if done:
-        mark = (min(retry) - 1) if retry else max(done)
+    if uids:
+        mark = max(uids)
         if mark > (state.get("last_uid") or 0):
             state["last_uid"] = mark
             dirty = True
+    # Anything deferred is remembered by UID and re-fetched next pass, whatever
+    # the watermark does. Bounded, so a permanently stuck message cannot grow
+    # the file without limit.
+    still_held = sorted(set(retry) | {u for u in held if u in retry})
+    settled = [u for u in held if u in uids and u not in retry]
+    if still_held or settled:
+        keep = sorted(set(still_held) | {u for u in held if u not in uids})
+        state["held_uids"] = keep[-MAX_HELD:]
+        dirty = True
 
     try:
         if flagged:
@@ -2201,9 +2599,28 @@ def main():
     auth_failures = 0
     while True:
         try:
-            with IMAPClient(IMAP_HOST, ssl=True) as server:
+            # Without a timeout a half-open TCP connection - a router reboot,
+            # an ISP re-IP, a NAS link flap - leaves idle_done() blocked in
+            # recv() forever. The process is single-threaded, so it stops
+            # answering mail and never exits, and there is no healthcheck to
+            # notice. Every other network call here already sets one.
+            with IMAPClient(IMAP_HOST, ssl=True, timeout=IMAP_TIMEOUT) as server:
                 server.login(SELF, APP_PASSWORD)
-                server.select_folder("INBOX")
+                folder = server.select_folder("INBOX")
+                seen_validity = int(folder.get(b"UIDVALIDITY", 0) or 0)
+                known = int(state.get("uidvalidity") or 0)
+                if seen_validity and known and seen_validity != known:
+                    # The server renumbered the mailbox. Every new message now
+                    # has a UID below our watermark, so without this the bot
+                    # would go quiet forever while the weekly heartbeat kept
+                    # insisting it was fine.
+                    log.warning("mailbox UIDVALIDITY changed (%d -> %d) - "
+                                "resetting the scan watermark", known, seen_validity)
+                    state["last_uid"] = 0
+                    state["held_uids"] = []
+                if seen_validity and seen_validity != known:
+                    state["uidvalidity"] = seen_validity
+                    save_state(state)
                 detect_label_mode(server)
                 log.info("connected - waiting for mail (IMAP IDLE, push)")
                 backoff = 5
@@ -2216,6 +2633,13 @@ def main():
                     maybe_reports(state)
                     if responses:
                         log.info("new mail signal: %s", responses[:3])
+                        process_unseen(server, state)
+                    elif state.get("held_uids"):
+                        # Nothing new arrived, but something is waiting on a
+                        # retry. Without this it waited for an unrelated
+                        # stranger to write in - potentially forever.
+                        log.info("%d message(s) held - retrying",
+                                 len(state["held_uids"]))
                         process_unseen(server, state)
         except KeyboardInterrupt:
             log.info("shutting down")

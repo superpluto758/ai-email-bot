@@ -408,6 +408,24 @@ Things that go wrong in the field, and what the bot does about them:
   consecutive failures to conclude the server refuses custom keywords.
 - **Sends are retried up to three times**, then abandoned — each retry costs
   another API call, so infinite requeueing is worse than giving up.
+- **A deferred message is remembered by ID**, not inferred from a watermark, so
+  a message held back by a rate limit or a transient API failure is picked up
+  again on the next pass — including when no new mail arrives to trigger one.
+- **A corrupt state file stops the bot** rather than silently starting on
+  defaults. Starting fresh would empty the allowlist and every counter, then
+  overwrite the only copy; instead the damaged file is kept aside and the
+  failure is loud.
+- **Writes are durable** — flushed and fsynced before the rename, so a power
+  cut cannot leave a half-written state file.
+- **A mailbox renumber is detected** (UIDVALIDITY), which would otherwise leave
+  the bot scanning above every new message forever while the weekly heartbeat
+  kept reporting it healthy.
+- **Quoted text never changes a setting.** An address only takes effect if the
+  admin typed it in that message — alerts quote strangers verbatim and invite a
+  reply, so quoted text is treated as data, never as an instruction.
+- **Signature logos are not attachments.** Small inline images a mail client
+  adds by itself are ignored, so ordinary text mail is not declined as though
+  the sender attached a file.
 
 ---
 
