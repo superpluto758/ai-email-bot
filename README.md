@@ -29,12 +29,15 @@ another account on someone else's platform.
 - **Per-user limits** — a daily reply cap per person, editable by email; owners
   are always unlimited
 - **Analytics on demand** — messages, tokens, searches and cost per person
-- **Weekly and monthly summaries** emailed to the owners, the weekly one
+- **Weekly, monthly and yearly summaries** emailed to you, the weekly one
   doubling as a heartbeat
 - **Memory** — it remembers useful context about the people who write to it,
   stored on your own machine
-- **Cheaper routing** — short, plain questions go to a smaller model
+- **Tiered routing** — trivial questions go to Haiku, short ones to Sonnet, the
+  rest to your main model, automatically and for free
 - **A content policy for non-owners**, with alerts to you when it triggers
+- **Formatted replies** — tables and figures keep their alignment in Gmail and
+  Outlook, via a plain-text and HTML pair
 
 ## What it deliberately will not do
 
@@ -50,6 +53,11 @@ These are enforced in code, not left to the model's judgement:
 - **Never hammers a mail server.** Five rejected logins and it stops
   permanently rather than retrying — repeated failures look like credential
   stuffing and get mailboxes suspended.
+- **Never silently drops a real person.** A stranger's message is never
+  answered, but if it looks like a human wrote it you are told. Being unsure
+  counts as human — see [Who gets flagged](#who-gets-flagged).
+- **Never pushes mail to an address you have marked quiet.** See
+  `NEVER_UNPROMPTED_ADDRESSES`.
 
 ---
 
@@ -102,6 +110,9 @@ rather than a fault here. Publish **SPF**, **DKIM** and **DMARC** for your
 domain — most providers give you the exact records — and have early recipients
 mark the first reply as "not spam". Reputation builds over days.
 
+Once DMARC is on you will start receiving daily aggregate reports. Put that
+sender in `IGNORE_SENDERS` and the assistant will leave them alone entirely.
+
 ---
 
 ## Using it
@@ -110,6 +121,10 @@ mark the first reply as "not spam". Reputation builds over days.
 
 Email the address. Attach a photo, forward something, write in any language.
 Replies stay in thread, so follow-up questions keep their context.
+
+It reads **every** message that arrives, not just unread ones — opening an email
+on your phone before the bot gets to it does not cause it to be missed. On first
+run it marks where it started, so an existing inbox is never answered in bulk.
 
 ### Admin commands
 
@@ -122,9 +137,11 @@ From an admin address, in plain English:
 | Let someone send files | `allow alice@example.com to send files` |
 | Revoke file permission | `remove alice@example.com from the file allowlist` |
 | Change tone | `keep replies shorter and more casual` |
-| Switch model | `use sonnet` / `use opus` |
+| Switch model | `use sonnet` / `use opus` / `use haiku` / `use fable` |
 | Analytics | `show me the analytics` / `how's it going?` |
 | Cost | `what have I spent this month?` |
+| Cost for the year | `yearly cost report` |
+| Cost week by week | `show me the weekly spend` |
 | Stats for one person | `how much has alice@example.com used?` |
 | Set someone's limit | `set alice@example.com 25 msg/day` |
 | Remove a limit | `make alice unlimited` |
@@ -147,6 +164,7 @@ SYSTEM
   Running for:      4.2 days
   People allowed:   5   (may send files: 4)
   Default limit:    25 msg/day
+  Custom limits:    2 set
   Send caps:        30/hour, 150/day  (used today: 7)
   This month:       £10.98 across 1,300,000 in / 290,000 out tokens, 15 searches
 
@@ -159,9 +177,16 @@ bob@example.com            6      4     400,000      90,000        3     £3.38
 `sent` is what they emailed in, `recv` is what they got back — a gap between
 them means messages were declined, rate limited or skipped.
 
-Naming someone narrows both tables to them. The same layout is emailed weekly
-and at month end, so the scheduled report and the on-demand one can never drift
+Naming someone narrows the tables to them. The same layout is emailed weekly and
+at month end, so the scheduled report and the on-demand one can never drift
 apart.
+
+Cost is also kept as a three-month rolling view and a year-end summary broken
+down by month. Week-by-week buckets exist too, but are only shown when an admin
+asks for them — they would otherwise bury the monthly figures that matter.
+
+Tables are sent as both plain text and HTML, so columns stay aligned in clients
+that would otherwise reflow them.
 
 ### Memory
 
@@ -176,6 +201,41 @@ person's next conversation:
 
 Capped and trimmed oldest-first. Ask what it knows, or tell it to forget
 someone, at any time. Set `MEMORY_ENABLED: "0"` to keep nothing.
+
+### Model routing
+
+Not every question needs the expensive model, and the routing is a free
+length-and-shape check rather than an extra API call:
+
+| Message | Goes to |
+|---|---|
+| Under `TRIVIAL_MAX_CHARS` | `TRIVIAL_MODEL` (Haiku) |
+| Under `SIMPLE_MAX_CHARS` | `SIMPLE_MODEL` (Sonnet) |
+| Anything with an attachment, from an owner, or mentioning something time-sensitive | your main `MODEL` |
+
+Models in `NEVER_AUTO_ROUTE` are never chosen automatically — an admin has to
+ask for them by name. Set either tier to `""` to switch it off.
+
+### Who gets flagged
+
+Mail from someone not on the allowlist is never answered. What happens next is
+colour-coded on the message itself:
+
+| Tag | Meaning |
+|---|---|
+| `ai-answered` | replied to |
+| `ai-denied` | a real person wrote in and was not answered — **you are alerted** |
+| `ai-skipped` | bulk, automated, or nothing to answer |
+
+Obvious bulk mail is filtered in code first, for free — no-reply addresses,
+`List-Unsubscribe`, `Precedence: bulk`, `Auto-Submitted`. Only what survives
+that is shown to the model, which is told to assume a human unless the message
+proves otherwise and to name its evidence when it says otherwise. No evidence,
+an unparseable answer, or an API failure all fall back to treating the sender as
+a person.
+
+The asymmetry is deliberate: a wrong "bulk" means a real person is ignored and
+you never hear about it, while a wrong "person" costs one email you can delete.
 
 ### The content policy
 
@@ -209,18 +269,22 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `IMAP_HOST` / `SMTP_HOST` / `SMTP_PORT` | | Your provider's servers |
 | `ALLOWLIST` | | Who gets answered. Defaults to the admins |
 | `FILE_ALLOWLIST` | | Who may send attachments. Defaults to the admins |
-| `ALERT_ADDRESSES` | | Full alerts. Defaults to the admins |
-| `QUIET_ALERT_ADDRESSES` | | Same alerts, quotes removed |
+| `ALERT_ADDRESSES` | | Where alerts and reports go. Defaults to the admins |
+| `NEVER_UNPROMPTED_ADDRESSES` | | Admins who are never emailed unless they wrote first |
+| `IGNORE_SENDERS` | | Senders left completely alone — never read, answered or counted |
 | `FROM_NAME` | | Display name on replies |
+| `MODEL` | | Main model. Default `claude-opus-5` |
+| `TRIVIAL_MODEL` / `TRIVIAL_MAX_CHARS` | | Cheapest tier for very short questions |
+| `SIMPLE_MODEL` / `SIMPLE_MAX_CHARS` | | Middle tier for short questions |
 | `MAX_SENDS_PER_HOUR` / `MAX_SENDS_PER_DAY` | | Send caps |
 | `PER_USER_DAILY_LIMIT` | | Replies per person per day; admins exempt |
-| `WEEKLY_REPORT_DAYS` / `MONTHLY_REPORT` | | Scheduled summaries; `0` disables |
+| `WEEKLY_REPORT_DAYS` / `MONTHLY_REPORT` / `YEARLY_REPORT` | | Scheduled summaries; `0` disables |
 | `USD_TO_GBP` / `CURRENCY_SYMBOL` | | Currency for reports |
-| `SIMPLE_MODEL` / `SIMPLE_MAX_CHARS` | | Cheaper model for short questions |
 | `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` | | Remembering people between emails |
 | `REPLY_DELAY_MIN` / `REPLY_DELAY_MAX` | | Random delay, seconds |
 | `AUTH_FAIL_LIMIT` | | Rejected logins before it stops |
 | `TZ`, `STATE_PATH` | | Timezone, state file location |
+| `PYTHONUTF8`, `LANG` | | Keep `£`, accents and non-Latin scripts intact |
 
 The allowlists in the environment are **seeds**. Once running, they live in the
 state file and are changed by email.
@@ -240,19 +304,38 @@ reject very long lines, which is why the embedded payload is wrapped.
 
 ---
 
+## Reliability
+
+Things that go wrong in the field, and what the bot does about them:
+
+- **One bad message** cannot take down the connection. Each is processed in
+  isolation; a failure is logged with a traceback, tagged `ai-skipped`, and
+  raised to you as a flag saying that message was never answered.
+- **State is written even when something fails**, so work already done in a
+  batch is not lost and messages are not answered twice.
+- **A message is tagged and marked read the instant the reply is sent**, before
+  any bookkeeping, so an accounting failure can never leave an answered message
+  looking unanswered.
+- **A single labelling hiccup does not disable labelling.** It takes three
+  consecutive failures to conclude the server refuses custom keywords.
+- **Sends are retried up to three times**, then abandoned — each retry costs
+  another API call, so infinite requeueing is worse than giving up.
+
+---
+
 ## Costs
 
 The API is the running cost; the mailbox is a pound or two a month.
 
 Roughly, per reply: a text answer is fractions of a penny. **Web search and
 images are what add up** — a search costs about a cent, and a phone photo can be
-worth several thousand tokens. If many people use it, switch to a cheaper model
-by emailing `use sonnet`, and keep an eye on the console.
+worth several thousand tokens. If many people use it, lower the tier by emailing
+`use sonnet`, and keep an eye on the console.
 
 The send caps limit outbound mail. They do **not** cap spend — a blocked message
 still cost an API call to classify.
 
-Two things help: `SIMPLE_MODEL` routes short questions to a cheaper model for
+Two things help: tiered routing sends short questions to cheaper models for
 free, and the weekly report tells you what each person is costing before the
 bill does. Currency conversion uses a fixed rate you set; Anthropic bills in
 USD, so their console is authoritative.

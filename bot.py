@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-AI email assistant.
+AI Email Answerer - NAS edition.
 
 Watches the mailbox over IMAP IDLE (push, not polling) and answers allowlisted
-senders with Claude.
+senders with Claude. Ported from the Google Apps Script version.
 """
 
 import base64
@@ -53,11 +53,23 @@ STATE_PATH = os.environ.get("STATE_PATH", "/data/state.json")
 # remotely. Admins are unfiltered and never rate limited.
 ADMINS = _addresses("ADMIN_ADDRESSES")
 
-# Where alerts and scheduled reports go. ALERT_ADDRESSES get the full version
-# including quoted text; QUIET_ALERT_ADDRESSES get it with quotes removed,
-# which suits an address you would rather keep other people's words out of.
+# Where alerts and scheduled reports go. Defaults to every admin.
 ALERT_ADDRESSES = _addresses("ALERT_ADDRESSES") or list(ADMINS)
-QUIET_ALERT_ADDRESSES = _addresses("QUIET_ALERT_ADDRESSES")
+
+# Admin addresses that must never be emailed unless they wrote first. They keep
+# full admin powers - they can ask for anything and get an answer - but no
+# alert, report or notification is ever pushed to them. Useful for a work or
+# school account, where unsolicited automated mail is unwelcome and tends to be
+# filtered as spam by the gateway anyway.
+NEVER_UNPROMPTED = _addresses("NEVER_UNPROMPTED_ADDRESSES")
+
+
+def notify_admins():
+    """Owners who may be emailed without having asked. Every unprompted send -
+    flag alerts, policy alerts, limit warnings, scheduled reports - goes through
+    here, so an address listed above cannot be reached by accident."""
+    return [a for a in ALERT_ADDRESSES if not in_list(a, NEVER_UNPROMPTED)]
+
 
 # Who gets answered, and the smaller set allowed to send attachments. These are
 # seeds: they are stored in the state file, after which an admin can change
@@ -67,14 +79,19 @@ DEFAULT_FILE_ALLOWLIST = _addresses("FILE_ALLOWLIST") or list(ADMINS)
 
 DEFAULT_STYLE = ("clear, helpful and direct; as long as needed to fully answer; "
                  "match the language of the prompt")
-DEFAULT_MODEL = "claude-opus-5"
-ALLOWED_MODELS = {"claude-opus-5", "claude-sonnet-5"}
+DEFAULT_MODEL = os.environ.get("MODEL", "claude-opus-5")
+# Every model an admin is allowed to switch to by email.
+ALLOWED_MODELS = {"claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5",
+                  "claude-fable-5"}
+# Models automatic routing must never pick on its own - an admin has to ask
+# for them by name.
+NEVER_AUTO_ROUTE = {"claude-fable-5"}
 
 LABEL_ANSWERED = "ai-answered"
 LABEL_DENIED = "ai-denied"
 LABEL_SKIPPED = "ai-skipped"
 
-BOT_MARKER = "— AI assistant"
+BOT_MARKER = "\u2014 AI assistant"
 FLAG_PREFIX = "[AI Flag]"
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -82,13 +99,13 @@ IMAP_HOST = os.environ.get("IMAP_HOST", "imap.example.com")
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.example.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 FROM_NAME = os.environ.get("FROM_NAME", "AI Assistant")
-IDLE_REFRESH = 240          # re-arm IDLE every 4 min; Gmail drops it around 29
+IDLE_REFRESH = 240          # re-arm IDLE every 4 min; some servers drop it at 29
 MAX_SEEN_IDS = 3000
 
 # Abuse-safety limits. Repeatedly retrying a rejected login looks exactly like
 # credential stuffing to a mail provider and can get the account suspended, so
-# we give up rather than hammer. The send caps should sit under your
-# provider's own limits, and the delay stops replies looking machine-timed.
+# we give up rather than hammer. The send caps should sit under your provider's
+# own limits, and the delay stops replies looking machine-timed.
 AUTH_FAIL_LIMIT = int(os.environ.get("AUTH_FAIL_LIMIT", "5"))
 MAX_SENDS_PER_HOUR = int(os.environ.get("MAX_SENDS_PER_HOUR", "20"))
 MAX_SENDS_PER_DAY = int(os.environ.get("MAX_SENDS_PER_DAY", "80"))
@@ -98,6 +115,13 @@ AUTH_ERROR_MARKERS = ("authenticationfailed", "invalid credentials",
                       "login failed", "authentication failed",
                       "web login required", "application-specific password")
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+# Senders the assistant ignores completely. Their mail is never read by the
+# model, never classified, never answered, never counted and never labelled -
+# it is simply left sitting in the mailbox for you to read yourself. Intended
+# for machine reports (DMARC aggregate reports and the like). Set here, never
+# changeable by email.
+IGNORE_SENDERS = _addresses("IGNORE_SENDERS")
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s  %(levelname)-7s %(message)s")
@@ -118,12 +142,14 @@ def load_state():
         "send_failures": {},
         "usage": {},
         "spend": {},              # month -> {in, out, searches, usd}
+        "spend_week": {},         # ISO week -> same shape
         "by_user": {},            # month -> address -> full per-person tally
         "per_user_limits": {},    # address -> daily reply limit
         "sent_to": {},            # address -> reply timestamps
         "memory": {},             # address -> notes we keep about them
         "last_heartbeat": 0,
         "limit_notified": {},
+        "last_uid": 0,
     }
     try:
         with open(STATE_PATH) as fh:
@@ -164,6 +190,9 @@ def save_state(state):
         if kept:
             sent[addr] = kept
     state["sent_to"] = sent
+    cutoff_year = datetime.now().year - 1
+    state["spend_week"] = {k: v for k, v in (state.get("spend_week") or {}).items()
+                           if k[:4].isdigit() and int(k[:4]) >= cutoff_year}
     directory = os.path.dirname(STATE_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -315,19 +344,18 @@ MAX_SEND_ATTEMPTS = 3
 # can be given their own limit by email; those overrides live in the state file.
 PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "25"))
 
-# Heartbeat: how often to email the owners confirming the bot is alive. The
-# point is that silence becomes meaningful - if you stop getting these, it died.
-HEARTBEAT_DAYS = float(os.environ.get("HEARTBEAT_DAYS", "7"))
-
 # Scheduled reports to the owners: a weekly summary (which doubles as the
 # heartbeat) and a full summary when a month rolls over. "0" disables either.
 WEEKLY_REPORT_DAYS = float(os.environ.get("WEEKLY_REPORT_DAYS", "7"))
 MONTHLY_REPORT = os.environ.get("MONTHLY_REPORT", "1") not in ("0", "false", "no")
+YEARLY_REPORT = os.environ.get("YEARLY_REPORT", "1") not in ("0", "false", "no")
 
 # Simple questions can go to a cheaper model. Set to "" to always use the main
 # model. Routing is a cheap heuristic, not another API call.
 SIMPLE_MODEL = os.environ.get("SIMPLE_MODEL", "claude-sonnet-5")
 SIMPLE_MAX_CHARS = int(os.environ.get("SIMPLE_MAX_CHARS", "350"))
+TRIVIAL_MODEL = os.environ.get("TRIVIAL_MODEL", "claude-haiku-4-5")
+TRIVIAL_MAX_CHARS = int(os.environ.get("TRIVIAL_MAX_CHARS", "60"))
 
 # Remembering people between conversations. Notes are written by the model as
 # part of its normal reply, so this costs no extra API calls.
@@ -345,7 +373,18 @@ WEB_SEARCH_USD = 0.01          # per search
 # Anthropic bills in USD; reports are shown in GBP. This is a fixed rate rather
 # than a live lookup - set it to whatever your card is actually converting at.
 USD_TO_GBP = float(os.environ.get("USD_TO_GBP", "0.79"))
-CURRENCY = os.environ.get("CURRENCY_SYMBOL", "\u00a3")
+def _fix_mojibake(text):
+    """Undo UTF-8 bytes that were read as Latin-1 (turns "\u00c2\u00a3" back into "\u00a3").
+
+    Container environments often have no UTF-8 locale, so os.environ decodes
+    byte-for-byte and a pound sign arrives mangled."""
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+CURRENCY = _fix_mojibake(os.environ.get("CURRENCY_SYMBOL", "") or "\u00a3")
 
 USAGE_WINDOW = 90 * 86400      # how far back per-user counts are kept
 USAGE_COLUMNS = ((1, "1d"), (7, "7d"), (30, "30d"), (90, "3mo"))
@@ -435,6 +474,28 @@ def parse_json(text):
 
 # ------------------------------------------------------------ claude api ---
 
+# Usage from the most recent API call, read straight afterwards by
+# record_spend(). A module-level slot rather than a return value so the many
+# call sites do not all have to be rewritten to unpack a tuple.
+LAST_CALL = {}
+
+
+def _note_usage(model, data):
+    """Accumulate one API response's usage into LAST_CALL.
+
+    Called once per round, so a pause_turn continuation adds to the same
+    total rather than replacing it - otherwise every search-and-continue
+    answer would only be billed for its last leg."""
+    usage = (data or {}).get("usage") or {}
+    tally = LAST_CALL.setdefault("usage", {})
+    for key in ("input_tokens", "output_tokens",
+                "cache_read_input_tokens", "cache_creation_input_tokens"):
+        tally[key] = tally.get(key, 0) + usage.get(key, 0)
+    LAST_CALL["searches"] = LAST_CALL.get("searches", 0) + int(
+        (usage.get("server_tool_use") or {}).get("web_search_requests", 0))
+    LAST_CALL["model"] = model
+
+
 def call_claude(model, system, user_content, max_tokens=6000, web_search=False):
     """Call the Messages API. With web_search=True Claude may look facts up.
 
@@ -464,6 +525,7 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False):
 
     messages = [{"role": "user", "content": user_content}]
     data = None
+    LAST_CALL.clear()
     for _ in range(5):
         payload["messages"] = messages
         req = urllib.request.Request(API_URL, data=json.dumps(payload).encode(),
@@ -471,6 +533,7 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False):
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 data = json.loads(resp.read().decode())
+            _note_usage(model, data)
         except urllib.error.HTTPError as exc:
             log.error("Claude API %s: %s", exc.code, exc.read()[:400])
             return None
@@ -531,6 +594,38 @@ def clean_header(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+TABLE_LINE_RE = re.compile(r"^-{5,}\s*$|\S {2,}\S")
+
+
+def _html_version(body):
+    """Render the reply as HTML, keeping tables monospaced.
+
+    Mail clients show plain text in a proportional font, which destroys column
+    alignment. Blocks that look like a table are wrapped in <pre>; ordinary
+    prose stays as normal paragraphs."""
+    def esc(t):
+        return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    out = []
+    for block in re.split(r"\n\s*\n", body):
+        if not block.strip():
+            continue
+        lines = block.splitlines()
+        tabular = sum(1 for ln in lines if TABLE_LINE_RE.search(ln)) >= 2
+        if tabular:
+            out.append('<pre style="font-family:ui-monospace,SFMono-Regular,'
+                       'Menlo,Consolas,monospace;font-size:13px;line-height:1.45;'
+                       'background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;'
+                       'padding:12px;overflow-x:auto;white-space:pre;margin:12px 0">'
+                       + esc(block) + "</pre>")
+        else:
+            out.append('<p style="margin:12px 0;line-height:1.5">'
+                       + esc(block).replace("\n", "<br>") + "</p>")
+    return ('<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,'
+            'Helvetica,Arial,sans-serif;font-size:14px;color:#24292f">'
+            + "".join(out) + "</div>")
+
+
 def send_mail(to_addrs, subject, body, in_reply_to=None, references=None):
     msg = EmailMessage()
     msg["From"] = formataddr((FROM_NAME, SELF)) if FROM_NAME else SELF
@@ -550,6 +645,7 @@ def send_mail(to_addrs, subject, body, in_reply_to=None, references=None):
         msg["In-Reply-To"] = clean_header(in_reply_to)
         msg["References"] = clean_header(references or in_reply_to)
     msg.set_content(body, charset="utf-8")
+    msg.add_alternative(_html_version(body), subtype="html", charset="utf-8")
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=90) as smtp:
         smtp.login(SELF, APP_PASSWORD)
@@ -634,9 +730,13 @@ def record_spend(state, model, usage, searches=0, sender=None):
     """Accumulate token spend by month so the owners can see the bill coming."""
     if not usage:
         return
-    month = datetime.now().strftime("%Y-%m")
+    now = datetime.now()
+    month = now.strftime("%Y-%m")
+    week = "%s-W%02d" % (now.isocalendar()[0], now.isocalendar()[1])
     bucket = state.setdefault("spend", {}).setdefault(
         month, {"in": 0, "out": 0, "searches": 0, "usd": 0.0})
+    wbucket = state.setdefault("spend_week", {}).setdefault(
+        week, {"in": 0, "out": 0, "searches": 0, "usd": 0.0})
     tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
     tout = usage.get("output_tokens", 0)
     rate_in, rate_out = PRICES.get(model, PRICES["claude-opus-5"])
@@ -645,12 +745,91 @@ def record_spend(state, model, usage, searches=0, sender=None):
     bucket["searches"] += searches
     cost = (tin * rate_in + tout * rate_out) / 1_000_000 + searches * WEB_SEARCH_USD
     bucket["usd"] += cost
+    wbucket["in"] += tin
+    wbucket["out"] += tout
+    wbucket["searches"] += searches
+    wbucket["usd"] += cost
     if sender:
         u = user_tally(state, sender, month)
         u["in"] += tin
         u["out"] += tout
         u["searches"] += searches
         u["usd"] += cost
+
+
+def spend_rollups(state):
+    """Rolling three-month and year-to-date cost, from the monthly buckets."""
+    months = state.get("spend") or {}
+    if not months:
+        return ""
+    keys = sorted(months)
+    now = datetime.now()
+    last3 = keys[-3:]
+    this_year = [k for k in keys if k.startswith(now.strftime("%Y"))]
+
+    def total(sel):
+        return sum(months[k].get("usd", 0.0) for k in sel) * USD_TO_GBP
+
+    def tokens(sel):
+        return (sum(months[k].get("in", 0) for k in sel),
+                sum(months[k].get("out", 0) for k in sel),
+                sum(months[k].get("searches", 0) for k in sel))
+
+    lines = []
+    for label, sel in (("Last 3 months", last3), ("This year (%s)" % now.year, this_year)):
+        if not sel:
+            continue
+        tin, tout, srch = tokens(sel)
+        lines.append("  %-18s %9s   across %s in / %s out tokens, %d searches"
+                     % (label, "%s%.2f" % (CURRENCY, total(sel)),
+                        "{:,}".format(tin), "{:,}".format(tout), srch))
+    return "\n".join(lines)
+
+
+def yearly_cost_report(state, year=None):
+    """Cost only, every month of the year including months with nothing."""
+    year = str(year or datetime.now().strftime("%Y"))[:4]
+    months = state.get("spend") or {}
+    out = ["%-9s %11s" % ("Month", CURRENCY), "-" * 21]
+    total = 0.0
+    for m in range(1, 13):
+        key = "%s-%02d" % (year, m)
+        usd = months.get(key, {}).get("usd", 0.0)
+        total += usd
+        out.append("%-9s %11s" % (key, "%s%.2f" % (CURRENCY, usd * USD_TO_GBP)))
+    out += ["-" * 21,
+            "%-9s %11s" % ("TOTAL", "%s%.2f" % (CURRENCY, total * USD_TO_GBP)),
+            "", "Cost only, for %s. Converted at %.2f USD->GBP." % (year, USD_TO_GBP)]
+    return "\n".join(out)
+
+
+def weekly_cost_report(state, year=None):
+    """Cost only, week by week across the year."""
+    year = int(str(year or datetime.now().strftime("%Y"))[:4])
+    weeks = state.get("spend_week") or {}
+    mine = {k: v for k, v in weeks.items() if k.startswith("%d-W" % year)}
+    now = datetime.now()
+    last_week = now.isocalendar()[1] if now.year == year else 52
+    if not mine and now.year != year:
+        return "No spend recorded for %d." % year
+
+    out = ["%-10s %11s %s" % ("Week", CURRENCY, "commencing"), "-" * 38]
+    total = 0.0
+    for w in range(1, last_week + 1):
+        key = "%d-W%02d" % (year, w)
+        usd = mine.get(key, {}).get("usd", 0.0)
+        total += usd
+        try:
+            monday = datetime.fromisocalendar(year, w, 1).strftime("%d %b")
+        except ValueError:
+            continue
+        out.append("%-10s %11s %s" % (key, "%s%.2f" % (CURRENCY, usd * USD_TO_GBP),
+                                      monday))
+    out += ["-" * 38,
+            "%-10s %11s" % ("TOTAL", "%s%.2f" % (CURRENCY, total * USD_TO_GBP)),
+            "", "Cost only, week by week for %d. Converted at %.2f USD->GBP."
+            % (year, USD_TO_GBP)]
+    return "\n".join(out)
 
 
 def spend_report(state):
@@ -669,7 +848,11 @@ def spend_report(state):
     out += ["-" * 55,
             "%-9s %12s %12s %9s %9s" % ("TOTAL", "", "", "",
                                         "%s%.2f" % (CURRENCY, total * USD_TO_GBP)),
-            "", "Estimated from published per-token prices and converted at %.2f "
+            ""]
+    rollups = spend_rollups(state)
+    if rollups:
+        out += [rollups, ""]
+    out += ["Estimated from published per-token prices and converted at %.2f "
             "USD->GBP - the Anthropic console, in USD, is authoritative." % USD_TO_GBP]
     return "\n".join(out)
 
@@ -723,7 +906,13 @@ def full_analytics(state, only=None):
     month = datetime.now().strftime("%Y-%m")
     spend = (state.get("spend") or {}).get(month, {})
     started = state.get("started_at")
-    uptime = ("%.1f days" % ((time.time() - started) / 86400)) if started else "unknown"
+    if not started:
+        uptime = "unknown"
+    else:
+        mins = (time.time() - started) / 60
+        uptime = ("%.0f minutes" % mins if mins < 90 else
+                  "%.1f hours" % (mins / 60) if mins < 48 * 60 else
+                  "%.1f days" % (mins / 1440))
     limits = state.get("per_user_limits") or {}
 
     return "\n".join([
@@ -806,18 +995,24 @@ def add_memory(state, addr, note):
 
 
 def pick_model(state, thread_text, attachments, is_owner):
-    """Cheap heuristic routing - short plain questions do not need the top model."""
+    """Route by how much work the question needs.
+
+    Very short questions go to Haiku, short ones to Sonnet, everything else to
+    the configured main model. Automatic routing never picks a top-tier model
+    like Fable - that only happens when an admin asks for it by name."""
     main = state["model"]
-    if not SIMPLE_MODEL or SIMPLE_MODEL == main:
-        return main
     if attachments or is_owner:
-        return main
-    if len(thread_text) > SIMPLE_MAX_CHARS:
         return main
     if re.search(r"\b(latest|current|today|news|now|recent|price|score|who is "
                  r"the|202[5-9])\b", thread_text, re.I):
-        return main                      # anything time-sensitive gets the best
-    return SIMPLE_MODEL
+        return main                      # anything time-sensitive gets the main model
+
+    size = len(thread_text)
+    for model, ceiling in ((TRIVIAL_MODEL, TRIVIAL_MAX_CHARS),
+                           (SIMPLE_MODEL, SIMPLE_MAX_CHARS)):
+        if model and model not in NEVER_AUTO_ROUTE and size <= ceiling:
+            return model
+    return main
 
 
 def over_send_limit(state):
@@ -861,20 +1056,23 @@ def reply_subject(subject, body=""):
 
 
 _label_mode = None       # "gmail" | "keywords" | "off" - decided on connect
+_label_failures = 0      # consecutive failures; a single blip is not fatal
+LABEL_FAIL_LIMIT = 3
 
 
 def detect_label_mode(server):
     """Gmail has its own label extension; everyone else gets IMAP keywords."""
-    global _label_mode
+    global _label_mode, _label_failures
     try:
         _label_mode = "gmail" if b"X-GM-EXT-1" in server.capabilities() else "keywords"
     except Exception:
         _label_mode = "keywords"
+    _label_failures = 0
     log.info("labelling via %s", _label_mode)
 
 
 def label(server, uid, name):
-    global _label_mode
+    global _label_mode, _label_failures
     if _label_mode == "off":
         return
     try:
@@ -882,9 +1080,15 @@ def label(server, uid, name):
             server.add_gmail_labels([uid], [name])
         else:
             server.add_flags([uid], [name.encode()])
+        _label_failures = 0
     except Exception as exc:
-        log.warning("could not apply label %s: %s", name, exc)
-        if _label_mode == "keywords":
+        _label_failures += 1
+        log.warning("could not apply label %s (%d/%d): %s",
+                    name, _label_failures, LABEL_FAIL_LIMIT, exc)
+        # Only give up once it is clearly the server refusing keywords rather
+        # than a passing hiccup - switching off after a single blip silently
+        # loses every tag until the next restart.
+        if _label_mode == "keywords" and _label_failures >= LABEL_FAIL_LIMIT:
             _label_mode = "off"
             log.warning("this server rejects custom keywords - labelling disabled "
                         "(replies are unaffected)")
@@ -965,7 +1169,8 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
               "(or to forget them), or ASKING FOR USAGE STATS (how many emails "
               "each user has sent - set usage_report true and do not invent "
               "numbers, the real table is appended for you), "
-              '("use opus" = claude-opus-5, "use sonnet" = claude-sonnet-5). '
+              '("use opus" = claude-opus-5, "use sonnet" = claude-sonnet-5, '
+              '"use haiku" = claude-haiku-4-5, "use fable" = claude-fable-5). '
               "Any OTHER settings or action request (the admin list, forwarding, "
               "deleting, reading other mail, and so on) must be refused in the "
               "reply, noting it can only be changed in the bot's configuration. "
@@ -988,7 +1193,8 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
               'about someone, '
               'else [] for everyone, '
               '"style": string or null, '
-              '"model": "claude-opus-5"|"claude-sonnet-5"|null, '
+              '"model": one of claude-opus-5, claude-sonnet-5, claude-haiku-4-5, '
+              'claude-fable-5, or null if no model change was asked for, '
               '"reply": "the full reply body, answering any question asked and '
               'confirming exactly which settings changed, if any"}')
     # Admins get attachments and web search, same as anyone else.
@@ -1082,6 +1288,16 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
     # Any analytics question - cost, usage, a named person, or just "how's it
     # going" - returns the same full picture, so the reply never depends on the
     # wording. usage_for narrows the per-person tables to those addresses.
+    if parsed.get("weekly_cost"):
+        year = str(parsed["weekly_cost"])[:4]
+        log.info("weekly cost report requested for %s", year)
+        reply += "\n\n" + weekly_cost_report(state, year)
+
+    if parsed.get("yearly_cost"):
+        year = str(parsed["yearly_cost"])[:4]
+        log.info("yearly cost report requested for %s", year)
+        reply += "\n\n" + yearly_cost_report(state, year)
+
     if (parsed.get("analytics") or parsed.get("spend_report")
             or parsed.get("usage_report")):
         only = parsed.get("usage_for") or None
@@ -1112,6 +1328,13 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
                   "That can only be changed in the bot's configuration.)"
                   % ", ".join(sorted(set(protected))))
     return reply
+
+
+BLOCKED_NOTICE = (
+    "Your message was blocked automatically.\n\n"
+    "This assistant does not provide adult content. Nothing in your message was "
+    "answered.\n\n"
+    "If you think this was a mistake, contact the owner of this address.")
 
 
 def apply_policy(raw, sender, from_header, subject, received):
@@ -1150,32 +1373,66 @@ def apply_policy(raw, sender, from_header, subject, received):
 
 
 def classify_outsider(state, sender, subject, body):
-    system = ("You triage email for an auto-reply system. The sender is NOT on "
-              "the allowlist, so no reply will be sent. Decide: \"red\" if this "
-              "is a real person writing individually to the recipient and wanting "
-              "a reply; \"orange\" for anything automated, bulk, promotional, "
-              "notification-like, or ambiguous (when in doubt: orange). Respond "
-              "with ONLY JSON, no code fences: "
-              '{"flag": "red"|"orange", "summary": "one line: what they want", '
-              '"quote": "the 1-2 most important sentences quoted verbatim, or empty"}')
-    raw = call_claude(state["model"], system,
-                      "From: %s\nSubject: %s\n\n%s" % (sender, subject, body[:3000]),
-                      max_tokens=500)
-    return parse_json(raw)
+    """Decide whether a non-allowlisted message came from a real person.
 
-
-BLOCKED_NOTICE = (
-    "Your message was blocked automatically.\n\n"
-    "This assistant does not provide adult content. Nothing in your message was "
-    "answered.\n\n"
-    "If you think this was a mistake, contact the owner of this address.")
+    Deliberately biased towards "red". Genuine bulk mail is already filtered
+    out in code before this runs (no-reply addresses, List-Unsubscribe, bulk
+    precedence headers), so anything reaching here has already passed those
+    tests. The cost of the two mistakes is not symmetric: a wrongly-orange
+    message means a real person is silently ignored and the owner never hears
+    about it, while a wrongly-red one costs an email they can delete."""
+    system = (
+        "You triage email for an assistant. This sender is NOT on the allowlist, "
+        "so no reply will be sent either way - you are only deciding whether the "
+        "owner should be told about it.\n\n"
+        "\"red\" = a human being wrote this. Choose red for anything that reads "
+        "like a person typing: a question, a request, a greeting, a mistake, a "
+        "one-liner, a message in any language, a reply to something, even if it "
+        "is short, oddly worded, badly spelled, or you cannot tell what they "
+        "want.\n\n"
+        "\"orange\" = machine-generated, and you can point to why. Only choose "
+        "orange when there is clear positive evidence: a marketing or newsletter "
+        "layout, an unsubscribe footer, a receipt or order confirmation, a "
+        "delivery or security notification, a verification code, a calendar "
+        "invite, or an automated system report.\n\n"
+        "IMPORTANT: automated mail from obvious senders has already been "
+        "filtered out before you see this, so assume a human unless the message "
+        "itself proves otherwise. A personal-looking address at any consumer "
+        "mail provider is a person. WHEN IN DOUBT, CHOOSE RED. Being unsure is "
+        "itself a reason to pick red.\n\n"
+        "Respond with ONLY JSON, no code fences: "
+        '{"flag": "red"|"orange", "summary": "one line: what they want", '
+        '"why": "if orange, the specific evidence that it is machine-generated", '
+        '"quote": "the 1-2 most important sentences quoted verbatim, or empty"}')
+    try:
+        raw = call_claude(state["model"], system,
+                          "From: %s\nSubject: %s\n\n%s" % (sender, subject, body[:3000]),
+                          max_tokens=500)
+    except Exception as exc:
+        log.warning("triage call failed for %s (%s) - treating as a real person",
+                    sender, exc)
+        return {"flag": "red", "summary": "could not be triaged automatically",
+                "quote": ""}
+    verdict = parse_json(raw) or {}
+    # Orange has to be earned: it needs the flag AND the evidence for it.
+    # Anything else - a missing flag, an unparseable reply, an API failure -
+    # falls through to red, so a person is never silently dropped.
+    if verdict.get("flag") == "orange" and str(verdict.get("why") or "").strip():
+        return verdict
+    if verdict.get("flag") != "red":
+        log.info("unjustified '%s' verdict for %s - treating as a real person",
+                 verdict.get("flag") or "empty", sender)
+    verdict["flag"] = "red"
+    return verdict
 
 
 def send_policy_alert(entry):
     """Tell the owners a message hit the content policy.
 
-    Goes to ALERT_ADDRESSES only, and carries a short reason rather than a
-    verbatim quote of what the sender wrote."""
+    Goes to the alert addresses only - never to one listed in
+    NEVER_UNPROMPTED - and carries a short reason rather than a verbatim
+    quote, so you learn what kind of thing was asked without the sender's
+    own words being reported to you."""
     subject = "%s %s - %s" % (FLAG_PREFIX, entry["category"], entry["addr"])
     body = ("A message from %s was handled under the content policy.\n\n"
             "  From:     %s\n"
@@ -1187,13 +1444,13 @@ def send_policy_alert(entry):
             "%s" % (entry["addr"], entry["sender"], entry["subject"] or "(none)",
                     entry["date"], entry["category"], entry["action"],
                     entry["reason"], entry["footer"]))
-    send_mail(ALERT_ADDRESSES, subject, body)
+    send_mail(notify_admins(), subject, body)
     return 1
 
 
 def send_flag_alerts(flagged):
     subject = "%s %d email(s) flagged" % (FLAG_PREFIX, len(flagged))
-    full, quoteless = [], []
+    full = []
     for i, f in enumerate(flagged, 1):
         head = ("%d. From: %s\n"
                 "   Subject: %s\n"
@@ -1208,15 +1465,13 @@ def send_flag_alerts(flagged):
             "resolve", 'reply to them yourself, or email "add %s to the auto '
                        'reply list" from an admin address.' % f["addr"])
         full.append(head + (('\n   Quote: "%s"' % f["quote"]) if f["quote"] else "") + tail)
-        quoteless.append(head + tail)
     footer = "\n\nAutomated alert from your AI email answerer."
-    send_mail(ALERT_ADDRESSES, subject, "\n\n".join(full) + footer)
-    sends = 1
-    if QUIET_ALERT_ADDRESSES:
-        send_mail(QUIET_ALERT_ADDRESSES, subject,
-                  "\n\n".join(quoteless) + footer)
-        sends += 1
-    return sends  # counted against the send caps by the caller
+    targets = notify_admins()
+    if not targets:
+        log.warning("nobody to alert - %d flagged email(s) not reported", len(flagged))
+        return 0
+    send_mail(targets, subject, "\n\n".join(full) + footer)
+    return 1  # caller records this against the send caps
 
 
 # ------------------------------------------------------------ processing ---
@@ -1231,7 +1486,7 @@ def maybe_reports(state):
 
     The weekly one doubles as a heartbeat: if it stops arriving, the bot has
     died or the machine is offline, which is otherwise invisible."""
-    if not ALERT_ADDRESSES:
+    if not notify_admins():
         return
     now = time.time()
     this_month = datetime.now().strftime("%Y-%m")
@@ -1243,7 +1498,7 @@ def maybe_reports(state):
             state["last_monthly_month"] = this_month       # start the clock
         elif last_month_sent != this_month:
             try:
-                send_mail(ALERT_ADDRESSES,
+                send_mail(notify_admins(),
                           "%s monthly summary - %s" % (FLAG_PREFIX, last_month_sent),
                           _report_body(state,
                                        "Monthly summary for %s." % last_month_sent,
@@ -1257,6 +1512,26 @@ def maybe_reports(state):
             except Exception as exc:
                 log.error("monthly summary failed: %s", exc)
 
+    # --- yearly, cost only, on the first run after the year turns over ------
+    this_year = datetime.now().strftime("%Y")
+    last_year_sent = state.get("last_yearly_year")
+    if YEARLY_REPORT:
+        if not last_year_sent:
+            state["last_yearly_year"] = this_year
+        elif last_year_sent != this_year:
+            try:
+                send_mail(notify_admins(),
+                          "%s yearly cost summary - %s" % (FLAG_PREFIX, last_year_sent),
+                          "Total API cost for %s, month by month.\n\n%s\n\n"
+                          "This is cost only - for messages, tokens and per-person "
+                          "figures, ask the assistant for the analytics."
+                          % (last_year_sent, yearly_cost_report(state, last_year_sent)))
+                record_send(state)
+                state["last_yearly_year"] = this_year
+                log.info("yearly cost summary sent for %s", last_year_sent)
+            except Exception as exc:
+                log.error("yearly summary failed: %s", exc)
+
     # --- weekly -------------------------------------------------------------
     if WEEKLY_REPORT_DAYS <= 0:
         return
@@ -1267,7 +1542,7 @@ def maybe_reports(state):
     if now - last < WEEKLY_REPORT_DAYS * 86400:
         return
     try:
-        send_mail(ALERT_ADDRESSES,
+        send_mail(notify_admins(),
                   "%s weekly summary - assistant is running" % FLAG_PREFIX,
                   _report_body(state, "The email assistant is alive and connected.",
                                this_month,
@@ -1282,8 +1557,24 @@ def maybe_reports(state):
 
 
 def process_unseen(server, state):
+    """Look at every message that has arrived since the last one we handled.
+
+    Scanning by UID rather than by unread flag means it does not matter who or
+    what has already opened a message - if you read an email before the bot
+    got to it, it still gets answered."""
+    last = state.get("last_uid") or 0
     try:
-        uids = server.search(["UNSEEN"])
+        if last:
+            # "N:*" always returns at least the highest UID, so filter again.
+            uids = [u for u in server.search(["UID", "%d:*" % (last + 1)])
+                    if u > last]
+        else:
+            # First run on this mailbox: take the unread mail, and set the
+            # watermark to the top so an existing inbox is not answered in bulk.
+            uids = server.search(["UNSEEN"])
+            everything = server.search(["ALL"])
+            state["last_uid"] = max(everything) if everything else 0
+            log.info("first scan - watermark set at UID %d", state["last_uid"])
     except Exception as exc:
         log.error("search failed: %s", exc)
         return
@@ -1295,277 +1586,319 @@ def process_unseen(server, state):
     dirty = False
 
     for uid in uids:
-        raw = fetched.get(uid, {}).get(b"RFC822")
-        if not raw:
-            continue
-        msg = email.message_from_bytes(raw)
-        msg_id = (msg.get("Message-ID") or ("uid-%s" % uid)).strip()
-        if msg_id in state["seen_ids"]:
-            continue
-
-        sender = parseaddr(msg.get("From", ""))[1].lower()
-        subject = header(msg, "Subject")
-        body = body_text(msg)
-        received = fetched[uid].get(b"INTERNALDATE")
-
-        # Our own mail and our own alerts: never touch. The signature check
-        # looks only at newly typed text - when someone replies to us their
-        # client quotes our previous message, signature and all, and treating
-        # that as "ours" silently killed every follow-up in a thread.
-        own_text = new_text_only(body)
-        if (normalize(sender) == normalize(SELF)
-                or msg.get("X-AI-Bot")
-                or BOT_MARKER in own_text          # older replies, still quoted
-                or subject.startswith(FLAG_PREFIX)):
-            log.info("ignoring our own message from %s", sender)
-            state["seen_ids"].append(msg_id)
-            mark_seen(server, uid)
-            dirty = True
-            continue
-
-        state["seen_ids"].append(msg_id)
-        record_usage(state, sender)
-        dirty = True
-
-        if not in_list(sender, state["allowlist"]):
-            # Never reply. Colour-code only; leave read state alone.
-            if is_automated(msg, sender):
-                log.info("skipped %s - automated sender, not allowlisted", sender)
-                label(server, uid, LABEL_SKIPPED)
+        # A failure on one message must never take down the connection or
+        # lose the batch's state - log it, tell the owners, keep going.
+        sender, subject = "", ""
+        try:
+            raw = fetched.get(uid, {}).get(b"RFC822")
+            if not raw:
                 continue
-            verdict = classify_outsider(state, sender, subject, body) or {}
-            if verdict.get("flag") == "red":
-                label(server, uid, LABEL_DENIED)
+            msg = email.message_from_bytes(raw)
+            msg_id = (msg.get("Message-ID") or ("uid-%s" % uid)).strip()
+            if msg_id in state["seen_ids"]:
+                continue
+
+            sender = parseaddr(msg.get("From", ""))[1].lower()
+            subject = header(msg, "Subject")
+            body = body_text(msg)
+            received = fetched[uid].get(b"INTERNALDATE")
+
+            # Our own mail and our own alerts: never touch. The signature check
+            # looks only at newly typed text - when someone replies to us their
+            # client quotes our previous message, signature and all, and treating
+            # that as "ours" silently killed every follow-up in a thread.
+            own_text = new_text_only(body)
+            if (normalize(sender) == normalize(SELF)
+                    or msg.get("X-AI-Bot")
+                    or BOT_MARKER in own_text          # older replies, still quoted
+                    or subject.startswith(FLAG_PREFIX)):
+                log.info("ignoring our own message from %s", sender)
+                state["seen_ids"].append(msg_id)
+                mark_seen(server, uid)
+                dirty = True
+                continue
+
+            # Ignored senders are handled before anything else touches the
+            # message: no model, no classification, no counters, no labels, and
+            # deliberately not even marked as read - the message is left exactly
+            # as it arrived. Remembering the id stops it being reconsidered.
+            if in_list(sender, IGNORE_SENDERS):
+                log.info("ignoring %s (on the ignore list) - left untouched", sender)
+                state["seen_ids"].append(msg_id)
+                dirty = True
+                continue
+
+            state["seen_ids"].append(msg_id)
+            record_usage(state, sender)
+            dirty = True
+
+            if not in_list(sender, state["allowlist"]):
+                # Never reply. Colour-code only; leave read state alone.
+                if is_automated(msg, sender):
+                    log.info("skipped %s - automated sender, not allowlisted", sender)
+                    label(server, uid, LABEL_SKIPPED)
+                    continue
+                verdict = classify_outsider(state, sender, subject, body) or {}
+                if verdict.get("flag") == "red":
+                    label(server, uid, LABEL_DENIED)
+                    flagged.append({
+                        "sender": msg.get("From", sender),
+                        "addr": sender,
+                        "subject": subject,
+                        "date": received.isoformat() if received else "unknown",
+                        "summary": verdict.get("summary", ""),
+                        "quote": verdict.get("quote", ""),
+                    })
+                    log.info("flagged %s (red)", sender)
+                else:
+                    log.info("skipped %s - not allowlisted, judged automated/bulk: %s",
+                             sender, verdict.get("why") or "(no reason given)")
+                    label(server, uid, LABEL_SKIPPED)
+                continue
+
+            # --- allowlisted sender ---
+            if is_automated(msg, sender):
+                log.info("skipped %s - auto-reply/bounce/out-of-office", sender)
+                label(server, uid, LABEL_SKIPPED)
+                mark_seen(server, uid)
+                continue
+
+            # Work out what this message actually carries before deciding it is
+            # empty: the question is often in the subject, or the whole point is
+            # an attached photo with no body text at all.
+            attachments, unreadable = extract_attachments(msg)
+            has_subject = subject.strip().lower() not in EMPTY_SUBJECTS
+            sent_anything = bool(attachments or unreadable)
+
+            # Sending files is a separate permission from being answered at all.
+            files_refused = sent_anything and not in_list(
+                sender, state.get("file_allowlist", DEFAULT_FILE_ALLOWLIST))
+
+            if not own_text and not sent_anything and not has_subject:
+                log.info("skipped %s - empty message: no new text, no subject, "
+                         "no readable attachment", sender)
+                label(server, uid, LABEL_SKIPPED)
+                mark_seen(server, uid)
+                continue
+
+            joined = state["added_at"].get(normalize(sender))
+            if joined and received and received.timestamp() < joined:
+                log.info("ignoring pre-allowlist mail from %s", sender)
+                label(server, uid, LABEL_SKIPPED)
+                mark_seen(server, uid)
+                continue
+
+            hit = over_user_limit(state, sender)
+            if hit:
+                limit, used = hit
+                log.info("%s has had %d/%d replies today - declining", sender, used, limit)
+                already = state.setdefault("limit_notified", {})
+                day = datetime.now().strftime("%Y-%m-%d")
+                if already.get(normalize(sender)) != day:
+                    # Once per person per day, so a chatty sender cannot spam you.
+                    already[normalize(sender)] = day
+                    try:
+                        send_mail(notify_admins(),
+                                  "%s daily limit reached - %s" % (FLAG_PREFIX, sender),
+                                  "%s has hit their daily limit and is no longer being "
+                                  "answered today.\n\n"
+                                  "  Sender:  %s\n"
+                                  "  Limit:   %d msg/day\n"
+                                  "  Used:    %d\n"
+                                  "  Subject: %s\n\n"
+                                  "They were told to try again tomorrow. To raise it, "
+                                  "reply to the assistant with:\n"
+                                  "  set %s 50 msg/day"
+                                  % (sender, msg.get("From", sender), limit, used,
+                                     subject or "(none)", sender))
+                        record_send(state)
+                    except Exception as exc:
+                        log.error("limit alert failed: %s", exc)
+                human_pause()
+                try:
+                    send_mail([sender], reply_subject(subject, body),
+                              "You have reached your daily limit of %d replies from "
+                              "this assistant. It will start answering you again "
+                              "tomorrow.\n\nIf you need more, ask an admin to raise "
+                              "your limit." % limit,
+                              in_reply_to=msg.get("Message-ID"),
+                              references=" ".join(filter(None, [msg.get("References"),
+                                                                msg.get("Message-ID")])))
+                    record_send(state)
+                except Exception as exc:
+                    log.error("limit notice failed for %s: %s", sender, exc)
+                label(server, uid, LABEL_SKIPPED)
+                mark_seen(server, uid)
+                continue
+
+            limited = over_send_limit(state)
+            if limited:
+                log.warning("holding reply to %s - %s; will retry later", sender, limited)
+                state["seen_ids"].remove(msg_id)
+                continue
+
+            if files_refused:
+                # Declined outright: the message is not read or answered, and no
+                # API call is made, so an unauthorised file costs nothing.
+                n_files = len(attachments) + len(unreadable)
+                log.info("declined %s - %d attachment(s) from a text-only sender",
+                         sender, n_files)
+                decline = (
+                    "Your message was declined because it included a file attachment.\n\n"
+                    "This address accepts files only from senders who have been given "
+                    "file permission, and yours has not. Nothing in your email was read "
+                    "or answered.\n\n"
+                    "Please resend with the content pasted into the email as text, or "
+                    "ask an admin to grant your address permission to send files.")
+                human_pause()
+                try:
+                    send_mail([sender], reply_subject(subject, body),
+                              decline,
+                              in_reply_to=msg.get("Message-ID"),
+                              references=" ".join(filter(None, [msg.get("References"),
+                                                                msg.get("Message-ID")])))
+                except Exception as exc:
+                    log.error("decline notice failed for %s: %s", sender, exc)
+                    state["seen_ids"].remove(msg_id)
+                    continue
+                record_send(state)
                 flagged.append({
                     "sender": msg.get("From", sender),
                     "addr": sender,
                     "subject": subject,
                     "date": received.isoformat() if received else "unknown",
-                    "summary": verdict.get("summary", ""),
-                    "quote": verdict.get("quote", ""),
+                    "reason": "they are allowlisted but NOT permitted to send files, "
+                              "and this email carried an attachment - it was declined "
+                              "and never read",
+                    "summary": "sent %d file(s); the message was refused unread"
+                               % n_files,
+                    "quote": "",
+                    "resolve": 'they were told to paste the content as text. To let '
+                               'them send files, email "allow %s to send files" from '
+                               'an admin address.' % sender,
                 })
-                log.info("flagged %s (red)", sender)
-            else:
-                log.info("skipped %s - not allowlisted, looks automated/bulk", sender)
-                label(server, uid, LABEL_SKIPPED)
-            continue
-
-        # --- allowlisted sender ---
-        if is_automated(msg, sender):
-            log.info("skipped %s - auto-reply/bounce/out-of-office", sender)
-            label(server, uid, LABEL_SKIPPED)
-            mark_seen(server, uid)
-            continue
-
-        # Work out what this message actually carries before deciding it is
-        # empty: the question is often in the subject, or the whole point is
-        # an attached photo with no body text at all.
-        attachments, unreadable = extract_attachments(msg)
-        has_subject = subject.strip().lower() not in EMPTY_SUBJECTS
-        sent_anything = bool(attachments or unreadable)
-
-        # Sending files is a separate permission from being answered at all.
-        files_refused = sent_anything and not in_list(
-            sender, state.get("file_allowlist", DEFAULT_FILE_ALLOWLIST))
-
-        if not own_text and not sent_anything and not has_subject:
-            log.info("skipped %s - empty message: no new text, no subject, "
-                     "no readable attachment", sender)
-            label(server, uid, LABEL_SKIPPED)
-            mark_seen(server, uid)
-            continue
-
-        joined = state["added_at"].get(normalize(sender))
-        if joined and received and received.timestamp() < joined:
-            log.info("ignoring pre-allowlist mail from %s", sender)
-            label(server, uid, LABEL_SKIPPED)
-            mark_seen(server, uid)
-            continue
-
-        hit = over_user_limit(state, sender)
-        if hit:
-            limit, used = hit
-            log.info("%s has had %d/%d replies today - declining", sender, used, limit)
-            already = state.setdefault("limit_notified", {})
-            day = datetime.now().strftime("%Y-%m-%d")
-            if already.get(normalize(sender)) != day:
-                # Once per person per day, so a chatty sender cannot spam you.
-                already[normalize(sender)] = day
-                try:
-                    send_mail(ALERT_ADDRESSES,
-                              "%s daily limit reached - %s" % (FLAG_PREFIX, sender),
-                              "%s has hit their daily limit and is no longer being "
-                              "answered today.\n\n"
-                              "  Sender:  %s\n"
-                              "  Limit:   %d msg/day\n"
-                              "  Used:    %d\n"
-                              "  Subject: %s\n\n"
-                              "They were told to try again tomorrow. To raise it, "
-                              "reply to the assistant with:\n"
-                              "  set %s 50 msg/day"
-                              % (sender, msg.get("From", sender), limit, used,
-                                 subject or "(none)", sender))
-                    record_send(state)
-                except Exception as exc:
-                    log.error("limit alert failed: %s", exc)
-            human_pause()
-            try:
-                send_mail([sender], reply_subject(subject, body),
-                          "You have reached your daily limit of %d replies from "
-                          "this assistant. It will start answering you again "
-                          "tomorrow.\n\nIf you need more, ask an admin to raise "
-                          "your limit." % limit,
-                          in_reply_to=msg.get("Message-ID"),
-                          references=" ".join(filter(None, [msg.get("References"),
-                                                            msg.get("Message-ID")])))
-                record_send(state)
-            except Exception as exc:
-                log.error("limit notice failed for %s: %s", sender, exc)
-            label(server, uid, LABEL_SKIPPED)
-            mark_seen(server, uid)
-            continue
-
-        limited = over_send_limit(state)
-        if limited:
-            log.warning("holding reply to %s - %s; will retry later", sender, limited)
-            state["seen_ids"].remove(msg_id)
-            continue
-
-        if files_refused:
-            # Declined outright: the message is not read or answered, and no
-            # API call is made, so an unauthorised file costs nothing.
-            n_files = len(attachments) + len(unreadable)
-            log.info("declined %s - %d attachment(s) from a text-only sender",
-                     sender, n_files)
-            decline = (
-                "Your message was declined because it included a file attachment.\n\n"
-                "This address accepts files only from senders who have been given "
-                "file permission, and yours has not. Nothing in your email was read "
-                "or answered.\n\n"
-                "Please resend with the content pasted into the email as text, or "
-                "ask an admin to grant your address permission to send files.")
-            human_pause()
-            try:
-                send_mail([sender], reply_subject(subject, body),
-                          decline,
-                          in_reply_to=msg.get("Message-ID"),
-                          references=" ".join(filter(None, [msg.get("References"),
-                                                            msg.get("Message-ID")])))
-            except Exception as exc:
-                log.error("decline notice failed for %s: %s", sender, exc)
-                state["seen_ids"].remove(msg_id)
-                continue
-            record_send(state)
-            flagged.append({
-                "sender": msg.get("From", sender),
-                "addr": sender,
-                "subject": subject,
-                "date": received.isoformat() if received else "unknown",
-                "reason": "they are allowlisted but NOT permitted to send files, "
-                          "and this email carried an attachment - it was declined "
-                          "and never read",
-                "summary": "sent %d file(s); the message was refused unread"
-                           % n_files,
-                "quote": "",
-                "resolve": 'they were told to paste the content as text. To let '
-                           'them send files, email "allow %s to send files" from '
-                           'an admin address.' % sender,
-            })
-            label(server, uid, LABEL_SKIPPED)
-            mark_seen(server, uid)
-            continue
-
-        thread_text = "From: %s\nSubject: %s\n\n%s" % (msg.get("From"), subject, body)
-        if looks_forwarded(subject, body):
-            log.info("%s forwarded a message", sender)
-            thread_text += ("\n\n[This is a FORWARDED message. %s forwarded it to "
-                            "you and is the person you are replying to - answer them "
-                            "about the forwarded content. Do not address, greet or "
-                            "write to the original sender, and never suggest you have "
-                            "contacted them. If it is unclear what is being asked, "
-                            "summarise the forwarded message and ask what they need.]"
-                            % sender)
-        if attachments:
-            log.info("%s sent %d readable attachment(s)", sender, len(attachments))
-        if unreadable:
-            log.info("%s sent %d unreadable attachment(s): %s",
-                     sender, len(unreadable), "; ".join(unreadable))
-            thread_text += ("\n\n[The sender also attached files you cannot open: %s. "
-                            "If they matter to the question, say plainly that you could "
-                            "not read them and suggest pasting the content as text.]"
-                            % ", ".join(unreadable))
-
-        policy_alert = None
-        if is_admin(sender):
-            reply = handle_admin(state, thread_text, attachments, sender)  # unfiltered
-        else:
-            raw_reply = answer_normally(state, thread_text, attachments, sender)
-            note = (parse_json(raw_reply) or {}).get("memory") if raw_reply else None
-            if note:
-                add_memory(state, sender, note)
-            reply, policy_alert = apply_policy(
-                raw_reply, sender, msg.get("From", sender), subject, received)
-            if policy_alert:
-                log.info("content policy: %s from %s - %s", policy_alert["category"],
-                         sender, policy_alert["action"])
-
-        if reply is None:                       # API failure - retry next time
-            state["seen_ids"].remove(msg_id)
-            log.warning("no reply generated for %s - will retry", sender)
-            continue
-
-        human_pause()
-        try:
-            send_mail([sender], reply_subject(subject, body), reply,
-                      in_reply_to=msg.get("Message-ID"),
-                      references=" ".join(filter(None, [msg.get("References"),
-                                                        msg.get("Message-ID")])))
-        except Exception as exc:
-            fails = state.setdefault("send_failures", {})
-            fails[msg_id] = fails.get(msg_id, 0) + 1
-            log.error("send failed for %s (attempt %d/%d): %s",
-                      sender, fails[msg_id], MAX_SEND_ATTEMPTS, exc)
-            if fails[msg_id] >= MAX_SEND_ATTEMPTS:
-                log.error("giving up on this message - each retry costs another "
-                          "API call, so it will not be tried again")
                 label(server, uid, LABEL_SKIPPED)
                 mark_seen(server, uid)
-                fails.pop(msg_id, None)
+                continue
+
+            thread_text = "From: %s\nSubject: %s\n\n%s" % (msg.get("From"), subject, body)
+            if looks_forwarded(subject, body):
+                log.info("%s forwarded a message", sender)
+                thread_text += ("\n\n[This is a FORWARDED message. %s forwarded it to "
+                                "you and is the person you are replying to - answer them "
+                                "about the forwarded content. Do not address, greet or "
+                                "write to the original sender, and never suggest you have "
+                                "contacted them. If it is unclear what is being asked, "
+                                "summarise the forwarded message and ask what they need.]"
+                                % sender)
+            if attachments:
+                log.info("%s sent %d readable attachment(s)", sender, len(attachments))
+            if unreadable:
+                log.info("%s sent %d unreadable attachment(s): %s",
+                         sender, len(unreadable), "; ".join(unreadable))
+                thread_text += ("\n\n[The sender also attached files you cannot open: %s. "
+                                "If they matter to the question, say plainly that you could "
+                                "not read them and suggest pasting the content as text.]"
+                                % ", ".join(unreadable))
+
+            policy_alert = None
+            if is_admin(sender):
+                reply = handle_admin(state, thread_text, attachments, sender)  # unfiltered
             else:
-                state["seen_ids"].remove(msg_id)   # allow a retry
-            continue
+                raw_reply = answer_normally(state, thread_text, attachments, sender)
+                note = (parse_json(raw_reply) or {}).get("memory") if raw_reply else None
+                if note:
+                    add_memory(state, sender, note)
+                reply, policy_alert = apply_policy(
+                    raw_reply, sender, msg.get("From", sender), subject, received)
+                if policy_alert:
+                    log.info("content policy: %s from %s - %s", policy_alert["category"],
+                             sender, policy_alert["action"])
 
-        state.get("send_failures", {}).pop(msg_id, None)
-        record_send(state)
-        record_reply_to(state, sender)
-        record_spend(state, LAST_CALL.get("model", state["model"]),
-                     LAST_CALL.get("usage"), LAST_CALL.get("searches", 0), sender)
-        if policy_alert:
+            if reply is None:                       # API failure - retry next time
+                state["seen_ids"].remove(msg_id)
+                log.warning("no reply generated for %s - will retry", sender)
+                continue
+
+            human_pause()
             try:
-                record_send(state)
-                send_policy_alert(policy_alert)
+                send_mail([sender], reply_subject(subject, body), reply,
+                          in_reply_to=msg.get("Message-ID"),
+                          references=" ".join(filter(None, [msg.get("References"),
+                                                            msg.get("Message-ID")])))
             except Exception as exc:
-                log.error("policy alert failed: %s", exc)
-        label(server, uid, LABEL_ANSWERED)
-        mark_seen(server, uid)
+                fails = state.setdefault("send_failures", {})
+                fails[msg_id] = fails.get(msg_id, 0) + 1
+                log.error("send failed for %s (attempt %d/%d): %s",
+                          sender, fails[msg_id], MAX_SEND_ATTEMPTS, exc)
+                if fails[msg_id] >= MAX_SEND_ATTEMPTS:
+                    log.error("giving up on this message - each retry costs another "
+                              "API call, so it will not be tried again")
+                    label(server, uid, LABEL_SKIPPED)
+                    mark_seen(server, uid)
+                    fails.pop(msg_id, None)
+                else:
+                    state["seen_ids"].remove(msg_id)   # allow a retry
+                continue
 
-    if flagged:
-        try:
-            for _ in range(send_flag_alerts(flagged) or 0):
-                record_send(state)
+            # The reply is away, so the message is answered - record that on the
+            # message itself first. Bookkeeping below must never be able to stop
+            # the tag being applied or the mail being marked read, or a failure
+            # there leaves the message looking unanswered and gets it replied
+            # to twice.
+            label(server, uid, LABEL_ANSWERED)
+            mark_seen(server, uid)
+
+            state.get("send_failures", {}).pop(msg_id, None)
+            record_send(state)
+            record_reply_to(state, sender)
+            try:
+                record_spend(state, LAST_CALL.get("model", state["model"]),
+                             LAST_CALL.get("usage"), LAST_CALL.get("searches", 0),
+                             sender)
+            except Exception as exc:
+                log.error("could not record spend for %s: %s", sender, exc)
+            if policy_alert:
+                try:
+                    record_send(state)
+                    send_policy_alert(policy_alert)
+                except Exception as exc:
+                    log.error("policy alert failed: %s", exc)
+
         except Exception as exc:
-            log.error("flag alert failed: %s", exc)
-    if dirty:
-        save_state(state)
+            log.exception("uid %s failed to process - skipping it", uid)
+            dirty = True
+            flagged.append({
+                "sender": sender or "(unknown sender)",
+                "addr": sender,
+                "subject": subject or "(unknown subject)",
+                "date": "unknown",
+                "summary": ("this message could not be processed because of an "
+                            "internal error, so it was never answered: %s" % exc),
+                "quote": "",
+            })
+            try:
+                label(server, uid, LABEL_SKIPPED)
+            except Exception:
+                pass
+
+    try:
+        if flagged:
+            try:
+                for _ in range(send_flag_alerts(flagged) or 0):
+                    record_send(state)
+            except Exception as exc:
+                log.error("flag alert failed: %s", exc)
+    finally:
+        if dirty:
+            save_state(state)
 
 
 # ------------------------------------------------------------------ main ---
 
 def main():
-    missing = [n for n, v in (("MAIL_ADDRESS", SELF),
-                              ("MAIL_PASSWORD", APP_PASSWORD),
-                              ("ANTHROPIC_API_KEY", API_KEY),
-                              ("ADMIN_ADDRESSES", ADMINS)) if not v]
+    missing = [n for n, v in (("MAIL_PASSWORD", APP_PASSWORD),
+                              ("ANTHROPIC_API_KEY", API_KEY)) if not v]
     if missing:
         log.error("missing required setting(s): %s", ", ".join(missing))
         sys.exit(1)
@@ -1610,7 +1943,7 @@ def main():
                               "repeated failures can get a mail account "
                               "suspended.", auth_failures)
                     log.error("Check MAIL_ADDRESS and MAIL_PASSWORD, then "
-                              "restart to try again.")
+                              "redeploy this project to start again.")
                     log.error("=" * 66)
                     while True:            # idle forever; no further logins
                         time.sleep(3600)

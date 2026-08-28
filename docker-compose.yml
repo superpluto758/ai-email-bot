@@ -14,9 +14,9 @@ services:
       MAIL_PASSWORD: "[app password for that mailbox]"
 
       # Your provider's IMAP and SMTP hosts. Examples:
+      #   Fastmail:   imap.fastmail.com  / smtp.fastmail.com
       #   Zoho (EU):  imap.zoho.eu       / smtp.zoho.eu
       #   Zoho (com): imap.zoho.com      / smtp.zoho.com
-      #   Fastmail:   imap.fastmail.com  / smtp.fastmail.com
       #   Gmail:      imap.gmail.com     / smtp.gmail.com   (see README warning)
       IMAP_HOST: "imap.example.com"
       SMTP_HOST: "smtp.example.com"
@@ -37,46 +37,69 @@ services:
       # file has the whole message declined unread. Defaults to the admins.
       FILE_ALLOWLIST: "[your email]"
 
-      # ---- alerts (optional) ----------------------------------------------
-      # Full alerts, including quoted text. Defaults to the admins.
+      # ---- alerts and notifications (optional) ----------------------------
+      # Where flag alerts, policy alerts and scheduled reports go. Defaults to
+      # the admins.
       ALERT_ADDRESSES: "[your email]"
-      # Same alerts with all quoted content removed. Useful for a work or
-      # school address you would rather keep other people's words out of.
-      QUIET_ALERT_ADDRESSES: ""
+
+      # Admin addresses that are NEVER emailed unless they wrote first. They
+      # keep full admin powers - they can ask for anything and get an answer -
+      # but no alert or report is ever pushed to them. Worth using for a work
+      # or school account, where unsolicited automated mail is unwelcome and
+      # usually filtered as spam by the gateway anyway.
+      NEVER_UNPROMPTED_ADDRESSES: ""
+
+      # Senders ignored completely: never read by the model, never classified,
+      # answered, counted or labelled - just left in the mailbox for you. Meant
+      # for machine reports such as DMARC aggregates.
+      IGNORE_SENDERS: "noreply-dmarc-support@google.com"
 
       # ---- behaviour (optional) -------------------------------------------
       FROM_NAME: "AI Assistant"       # display name on replies
       TZ: "Europe/London"
       STATE_PATH: "/data/state.json"
 
+      # Some containers default to ASCII, which mangles pound signs, accents
+      # and non-Latin scripts on the way out.
+      PYTHONUTF8: "1"
+      LANG: "C.UTF-8"
+
       # Abuse safety. Repeatedly retrying a rejected login looks like
       # credential stuffing and can get a mailbox suspended, so the bot stops
       # instead. The send caps should sit below your provider's own limit.
       AUTH_FAIL_LIMIT: "5"
-      MAX_SENDS_PER_HOUR: "30"
-      MAX_SENDS_PER_DAY: "150"
+      MAX_SENDS_PER_HOUR: "20"
+      MAX_SENDS_PER_DAY: "80"
 
       # Random delay before replying, so traffic is not machine-timed.
-      REPLY_DELAY_MIN: "5"
-      REPLY_DELAY_MAX: "15"
+      REPLY_DELAY_MIN: "4"
+      REPLY_DELAY_MAX: "20"
 
       # ---- limits, reports and analytics ----------------------------------
       # Replies per person per day. Admins are always unlimited. Individual
       # people can be given their own limit by email.
       PER_USER_DAILY_LIMIT: "25"
 
-      # Scheduled summaries to the owners. The weekly one doubles as a
+      # Scheduled summaries to the alert addresses. The weekly one doubles as a
       # heartbeat: if it stops arriving, the bot or its machine is down.
       WEEKLY_REPORT_DAYS: "7"         # "0" disables
       MONTHLY_REPORT: "1"             # month-end summary; "0" disables
+      YEARLY_REPORT: "1"              # year-end cost summary; "0" disables
 
       # Reports are shown in your currency. Anthropic bills in USD; this is a
       # fixed rate, not a live lookup.
       USD_TO_GBP: "0.79"
       CURRENCY_SYMBOL: "£"
 
-      # Short, plain questions can go to a cheaper model. Set to "" to always
-      # use the main one. This is a free heuristic, not an extra API call.
+      # ---- model routing ---------------------------------------------------
+      # The model used for anything that is not obviously trivial or simple.
+      MODEL: "claude-opus-5"
+
+      # Short, plain questions are routed to cheaper models automatically.
+      # This is a free length-and-shape heuristic, not an extra API call.
+      # Set either model to "" to switch that tier off.
+      TRIVIAL_MODEL: "claude-haiku-4-5"
+      TRIVIAL_MAX_CHARS: "60"
       SIMPLE_MODEL: "claude-sonnet-5"
       SIMPLE_MAX_CHARS: "350"
 
