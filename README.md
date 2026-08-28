@@ -36,6 +36,8 @@ another account on someone else's platform.
 - **Tiered routing** — trivial questions go to Haiku, short ones to Sonnet, the
   rest to your main model, automatically and for free
 - **A content policy for non-owners**, with alerts to you when it triggers
+- **A quiet flag** when someone who is not an owner tries to act like one — they
+  get their normal reply, nothing changes, and you hear about it
 - **Formatted replies** — tables and figures keep their alignment in Gmail and
   Outlook, via a plain-text and HTML pair
 
@@ -58,6 +60,9 @@ These are enforced in code, not left to the model's judgement:
   counts as human — see [Who gets flagged](#who-gets-flagged).
 - **Never pushes mail to an address you have marked quiet.** See
   `NEVER_UNPROMPTED_ADDRESSES`.
+- **Never applies a setting change for a non-admin**, however the request is
+  phrased. Admin status is checked in code before the model sees the message.
+  An attempt is answered normally and quietly flagged to you.
 
 ---
 
@@ -250,6 +255,24 @@ Admins are unfiltered. Everyone else is classified per message:
 
 Alerts carry a short reason, never a verbatim quote — you learn what kind of
 thing was asked without the person's words being reported to you.
+
+### When someone tries to act as an owner
+
+If a non-admin asks for something only an owner can do — adding someone to the
+allowlist, granting file permission, making themselves an admin, changing the
+model or tone, setting limits, or asking for usage and cost figures — they are
+answered completely normally and **nothing changes**. You get a quiet
+`[AI Flag] admin attempt` alert naming what they asked for.
+
+They are never told they were noticed: no warning, no refusal notice, no change
+to their experience. This is a second pair of eyes rather than a defence — the
+defence is that admin actions are only ever applied for an address in
+`ADMIN_ADDRESSES`, checked in code before the model is involved at all.
+
+It is detected in the same classification pass that already runs on non-admin
+mail, so it costs no extra API call, and it is independent of the category
+above: an ordinary question that also asks for a setting change raises the flag
+and still gets its ordinary answer.
 
 The helplines named are UK-based (Samaritans, Childline). If you are elsewhere,
 edit `NON_ADMIN_POLICY` in `bot.py`.
