@@ -13,6 +13,7 @@ import logging
 import os
 import random
 import re
+import signal
 import smtplib
 import ssl
 import sys
@@ -2134,6 +2135,31 @@ def process_unseen(server, state):
 
 # ------------------------------------------------------------------ main ---
 
+def shutdown_cleanly(state):
+    """Save and exit on SIGTERM.
+
+    Docker sends SIGTERM on stop, restart and redeploy. Python's default action
+    for it is to die immediately - no exception, no finally, nothing flushed -
+    so the container was being killed with unsaved state and, ten seconds later,
+    SIGKILLed (exit 137). Worse, a message answered but not yet recorded would
+    be answered a second time on the next start."""
+    def handler(signum, _frame):
+        log.info("signal %d received - saving state and shutting down", signum)
+        try:
+            save_state(state)
+        except Exception as exc:
+            log.error("could not save state while shutting down: %s", exc)
+        # SystemExit is not an Exception, so it unwinds past the reconnect
+        # handler and closes the IMAP connection on its way out.
+        sys.exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass          # not the main thread, or the platform lacks it
+
+
 def main():
     missing = [n for n, v in (("MAIL_PASSWORD", APP_PASSWORD),
                               ("ANTHROPIC_API_KEY", API_KEY)) if not v]
@@ -2163,6 +2189,7 @@ def main():
                  human_duration(gap))
     # Written straight away, so the clock survives even if no mail ever arrives.
     save_state(state)
+    shutdown_cleanly(state)
 
     log.info("AI email answerer starting - mailbox=%s via %s | model=%s | "
              "allowlist=%d | recording since %s (start #%d)",
