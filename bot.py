@@ -318,13 +318,25 @@ def new_text_only(body):
     return "\n".join(lines).strip()
 
 
+# Matched against the local part, not anchored to the "@", because real
+# machine addresses bury the giveaway in the middle of a longer name -
+# "noreply-dmarc-support@google.com" being the obvious example.
 AUTO_SENDER_RE = re.compile(
-    r"(no-?reply|donotreply|do-not-reply|mailer-daemon|postmaster|bounce|"
-    r"notifications?|alerts?)@", re.I)
+    r"^[^@]*\b(no-?reply|donotreply|do-not-reply|mailer-daemon|postmaster|"
+    r"bounce|notifications?|alerts?|dmarc[\w-]*|abuse)\b[^@]*@", re.I)
+
+# DMARC aggregate reports. RFC 7489 fixes the subject line, which is the only
+# thing every reporter has in common - the sending address varies wildly
+# (dmarcreport@microsoft.com, dmarc_support@yahoo.com, and plenty that give no
+# hint at all), so matching on the address alone leaves most of them looking
+# like a person wrote in.
+DMARC_SUBJECT_RE = re.compile(r"^\s*report domain\s*:", re.I)
 
 
 def is_automated(msg, sender):
     if AUTO_SENDER_RE.search(sender or ""):
+        return True
+    if DMARC_SUBJECT_RE.match(header(msg, "Subject")):
         return True
     auto = (msg.get("Auto-Submitted") or "").lower()
     if auto and auto != "no":
