@@ -1285,7 +1285,10 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
               "addresses, adding/removing FILE permission (who may send "
               "attachments - a separate, smaller list), changing reply style, "
               "or switching model, setting a per-person daily reply limit, asking "
-              "for ANALYTICS or a full report, allowing or revoking permission "
+              "for ANALYTICS or a full report, asking for a YEARLY cost report "
+              "(costs for every month of a year) or a WEEKLY spend breakdown "
+              "(week by week) - both are separate from the general report and "
+              "appear only when actually asked for, allowing or revoking permission "
               "to use the top model (a separate, smaller list again - people not "
               "on it are answered by the cheaper models), setting the reasoning "
               "effort level, asking "
@@ -1309,6 +1312,14 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
               '"usage_report": true if they asked how many emails have been sent, '
               'for usage/stats/counts/activity, else false, '
               '"usage_for": [emails] if they asked about specific people only, '
+              '"analytics": true if they asked for analytics, a report, stats, '
+              'or just how things are going, '
+              '"yearly_cost": the year as a number if they asked for a YEARLY or '
+              'annual cost report or a month-by-month breakdown of a year, else '
+              'null - use true if they did not name a year, '
+              '"weekly_cost": the year as a number if they asked for WEEKLY spend '
+              'or a week-by-week cost breakdown, else null - use true if they did '
+              'not name a year, '
               '"spend_report": true if they asked about cost, spend, billing or '
               'tokens, "set_limits": {"email": number} for per-person daily reply '
               'limits (0 or "unlimited" means no limit; admins are always '
