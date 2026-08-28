@@ -1,0 +1,73 @@
+services:
+  email-bot:
+    image: python:3.12-slim
+    container_name: email-bot
+    restart: unless-stopped
+
+    environment:
+      # ---- mailbox (required) ---------------------------------------------
+      # The address the assistant reads from and replies as.
+      MAIL_ADDRESS: "[user email to use as bot]"
+      # An app-specific password, not your normal account password. Most
+      # providers require one for IMAP; spaces and invisible characters are
+      # stripped automatically, so paste it exactly as given.
+      MAIL_PASSWORD: "[app password for that mailbox]"
+
+      # Your provider's IMAP and SMTP hosts. Examples:
+      #   Zoho (EU):  imap.zoho.eu       / smtp.zoho.eu
+      #   Zoho (com): imap.zoho.com      / smtp.zoho.com
+      #   Fastmail:   imap.fastmail.com  / smtp.fastmail.com
+      #   Gmail:      imap.gmail.com     / smtp.gmail.com   (see README warning)
+      IMAP_HOST: "imap.example.com"
+      SMTP_HOST: "smtp.example.com"
+      SMTP_PORT: "465"
+
+      # ---- Claude API (required) ------------------------------------------
+      ANTHROPIC_API_KEY: "[your anthropic api key]"
+
+      # ---- who can use it (required) --------------------------------------
+      # Owners. Only these can change settings by email. Deliberately NOT
+      # editable by email, because a From address can be forged.
+      ADMIN_ADDRESSES: "[your email],[your other email]"
+
+      # Who gets answered at all. Leave unset to default to the admins.
+      ALLOWLIST: "[your email],[a friend's email]"
+
+      # The smaller set allowed to send attachments. Anyone else who attaches a
+      # file has the whole message declined unread. Defaults to the admins.
+      FILE_ALLOWLIST: "[your email]"
+
+      # ---- alerts (optional) ----------------------------------------------
+      # Full alerts, including quoted text. Defaults to the admins.
+      ALERT_ADDRESSES: "[your email]"
+      # Same alerts with all quoted content removed. Useful for a work or
+      # school address you would rather keep other people's words out of.
+      QUIET_ALERT_ADDRESSES: ""
+
+      # ---- behaviour (optional) -------------------------------------------
+      FROM_NAME: "AI Assistant"       # display name on replies
+      TZ: "Europe/London"
+      STATE_PATH: "/data/state.json"
+
+      # Abuse safety. Repeatedly retrying a rejected login looks like
+      # credential stuffing and can get a mailbox suspended, so the bot stops
+      # instead. The send caps should sit below your provider's own limit.
+      AUTH_FAIL_LIMIT: "5"
+      MAX_SENDS_PER_HOUR: "30"
+      MAX_SENDS_PER_DAY: "150"
+
+      # Random delay before replying, so traffic is not machine-timed.
+      REPLY_DELAY_MIN: "5"
+      REPLY_DELAY_MAX: "15"
+
+    volumes:
+      - ./bot.py:/app/bot.py:ro
+      - ./data:/data           # allowlist, usage counts and state live here
+
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        pip install --quiet --no-cache-dir imapclient
+        exec python -u /app/bot.py

@@ -1,0 +1,12 @@
+# Never commit real configuration - it holds your password and API key
+docker-compose.override.yml
+compose-embedded.yml
+.env
+
+# Runtime state: allowlist, usage counts, seen message ids
+data/
+*.state.json
+
+__pycache__/
+*.pyc
+.DS_Store
