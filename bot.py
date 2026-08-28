@@ -822,9 +822,19 @@ def spend_rollups(state):
     return "\n".join(lines)
 
 
+def wanted_year(value):
+    """Which year an admin asked about.
+
+    They may name one ("costs for 2025") or just ask for "the yearly costs",
+    in which case the model returns true rather than a year - and int("True")
+    raises, taking the whole reply down with it."""
+    digits = re.sub(r"\D", "", str(value or ""))[:4]
+    return int(digits) if len(digits) == 4 else datetime.now().year
+
+
 def yearly_cost_report(state, year=None):
     """Cost only, every month of the year including months with nothing."""
-    year = str(year or datetime.now().strftime("%Y"))[:4]
+    year = str(wanted_year(year))
     months = state.get("spend") or {}
     out = ["%-9s %11s" % ("Month", CURRENCY), "-" * 21]
     total = 0.0
@@ -841,7 +851,7 @@ def yearly_cost_report(state, year=None):
 
 def weekly_cost_report(state, year=None):
     """Cost only, week by week across the year."""
-    year = int(str(year or datetime.now().strftime("%Y"))[:4])
+    year = wanted_year(year)
     weeks = state.get("spend_week") or {}
     mine = {k: v for k, v in weeks.items() if k.startswith("%d-W" % year)}
     now = datetime.now()
@@ -1422,12 +1432,12 @@ def handle_admin(state, thread_text, attachments=None, sender=""):
     # going" - returns the same full picture, so the reply never depends on the
     # wording. usage_for narrows the per-person tables to those addresses.
     if parsed.get("weekly_cost"):
-        year = str(parsed["weekly_cost"])[:4]
+        year = wanted_year(parsed["weekly_cost"])
         log.info("weekly cost report requested for %s", year)
         reply += "\n\n" + weekly_cost_report(state, year)
 
     if parsed.get("yearly_cost"):
-        year = str(parsed["yearly_cost"])[:4]
+        year = wanted_year(parsed["yearly_cost"])
         log.info("yearly cost report requested for %s", year)
         reply += "\n\n" + yearly_cost_report(state, year)
 
