@@ -152,6 +152,7 @@ def load_state():
         "seen_ids": [],
         "sent_times": [],
         "send_failures": {},
+        "reply_failures": {},    # message id -> refused generation attempts
         "usage": {},
         "spend": {},              # month -> {in, out, searches, usd}
         "spend_week": {},         # ISO week -> same shape
@@ -373,6 +374,10 @@ MAX_ONE_ATTACHMENT = 4 * 1024 * 1024      # API caps individual images
 MAX_ALL_ATTACHMENTS = 12 * 1024 * 1024    # keep the whole request sane
 MAX_ATTACHMENTS = 5
 MAX_SEND_ATTEMPTS = 3
+# A message the API keeps refusing - a corrupt image is the usual cause - must
+# not be retried forever. Every attempt costs another call, and the answer will
+# not change.
+MAX_REPLY_ATTEMPTS = 3
 # Per-user daily reply limit. Admins are always unlimited. Individual people
 # can be given their own limit by email; those overrides live in the state file.
 PER_USER_DAILY_LIMIT = int(os.environ.get("PER_USER_DAILY_LIMIT", "30"))
@@ -1988,10 +1993,38 @@ def process_unseen(server, state):
                     log.info("content policy: %s from %s - %s",
                              entry["category"], sender, entry["action"])
 
-            if reply is None:                       # API failure - retry next time
+            if reply is None:
+                # The API would not answer. Usually transient, so retry - but
+                # cap it: a corrupt attachment fails identically every time,
+                # and each attempt is billed.
+                tries = state.setdefault("reply_failures", {})
+                tries[msg_id] = tries.get(msg_id, 0) + 1
+                if tries[msg_id] >= MAX_REPLY_ATTEMPTS:
+                    log.error("giving up on %s after %d failed attempts - each "
+                              "retry costs another API call and the result is "
+                              "not changing", sender, tries[msg_id])
+                    tries.pop(msg_id, None)
+                    flagged.append({
+                        "sender": msg.get("From", sender),
+                        "addr": sender,
+                        "subject": subject,
+                        "date": received.isoformat() if received else "unknown",
+                        "summary": ("the assistant could not answer this message "
+                                    "after %d attempts and has stopped trying - "
+                                    "if it carried an image or PDF, that file was "
+                                    "most likely damaged in transit"
+                                    % MAX_REPLY_ATTEMPTS),
+                        "quote": "",
+                        "resolve": "ask them to resend it, ideally in a different "
+                                   "format.",
+                    })
+                    label(server, uid, LABEL_SKIPPED)
+                    mark_seen(server, uid)
+                    continue
                 state["seen_ids"].remove(msg_id)
                 retry.add(uid)
-                log.warning("no reply generated for %s - will retry", sender)
+                log.warning("no reply generated for %s (attempt %d/%d) - will retry",
+                            sender, tries[msg_id], MAX_REPLY_ATTEMPTS)
                 continue
 
             human_pause()
@@ -2025,6 +2058,7 @@ def process_unseen(server, state):
             mark_seen(server, uid)
 
             state.get("send_failures", {}).pop(msg_id, None)
+            state.get("reply_failures", {}).pop(msg_id, None)
             record_send(state)
             record_reply_to(state, sender)
             try:
