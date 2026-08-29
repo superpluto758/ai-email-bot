@@ -448,6 +448,31 @@ USD, so their console is authoritative.
 
 ---
 
+## Tests
+
+```bash
+python3 tests/run.py
+```
+
+221 assertions covering parsing, routing, permissions, the content policy,
+limits, cost arithmetic, the scheduled reports and the full message loop. They
+run `bot.py` directly with the network faked out — no mailbox, no API key, no
+state file of your own is touched, and nothing is sent.
+
+```
+test_admin_and_policy.py         59 passed, 0 failed
+test_audit_regressions.py        44 passed, 0 failed
+test_core.py                     83 passed, 0 failed
+test_processing.py               35 passed, 0 failed
+----------------------------------------------------
+221 assertions, 0 failures
+```
+
+`test_audit_regressions.py` is worth reading on its own: each case is a defect
+that reached production, written so it fails again if the fix is ever undone.
+
+---
+
 ## Requirements
 
 - Docker
