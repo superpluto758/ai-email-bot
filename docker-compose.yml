@@ -110,6 +110,34 @@ services:
       MEMORY_ENABLED: "1"             # "0" remembers nothing
       MEMORY_MAX_CHARS: "1200"
 
+    # Give the SIGTERM handler time to save before Docker resorts to SIGKILL.
+    stop_grace_period: 30s
+
+    # A ceiling, so a large backlog cannot take the host down with it. The bot
+    # idles around 25 MB.
+    mem_limit: 512m
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Visibility only: Docker marks an unhealthy container but does not restart
+    # it. The real protection against a wedged process is the watchdog inside
+    # bot.py, which exits non-zero so restart:unless-stopped can do its job.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,time,sys;
+          s=json.load(open('/data/state.json'));
+          sys.exit(0 if time.time()-s.get('last_active',0) < 3600 else 1)"
+      interval: 5m
+      timeout: 20s
+      retries: 3
+      start_period: 3m
+
     volumes:
       - ./bot.py:/app/bot.py:ro
       - ./data:/data           # allowlist, usage counts and state live here
@@ -119,5 +147,5 @@ services:
       - -c
       - |
         set -e
-        pip install --quiet --no-cache-dir imapclient
+        pip install --quiet --no-cache-dir 'imapclient==3.1.0'
         exec python -u /app/bot.py

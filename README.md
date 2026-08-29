@@ -377,6 +377,34 @@ Everything is set through environment variables in `docker-compose.yml`.
 The allowlists in the environment are **seeds**. Once running, they live in the
 state file and are changed by email.
 
+### HTML-only mail
+
+Plenty of real mail arrives with no plain-text part — anything from a school,
+a business, or a CRM. Those messages are converted to readable text before the
+model sees them: script and style blocks are dropped with their contents, block
+tags become line breaks, and entities are decoded.
+
+This matters more than it sounds. The length cap is applied *after* extraction,
+so handing over raw source meant a long Outlook message could be nothing but
+stylesheet by the time it arrived, with the sender's actual question never
+reaching the model at all.
+
+### Keeping it alive
+
+`restart: unless-stopped` handles a crash, but not a process that is merely
+stuck — and a Docker healthcheck does not help either, because it marks a
+container unhealthy without restarting it. So the bot watches itself: if a full
+cycle makes no progress for `WATCHDOG_SECONDS` (default 30 minutes) it saves
+state and exits non-zero, which lets the restart policy do its job.
+
+The compose file also sets `mem_limit`, log rotation, a `stop_grace_period`
+long enough for the shutdown handler to finish, and a healthcheck that reports
+the same liveness signal in your Docker UI.
+
+The `imapclient` version is pinned. Unpinned, the container installs the latest
+release on every start — which means a PyPI outage during a reboot leaves the
+bot unable to start at all.
+
 ### Running on a NAS
 
 Some NAS Docker interfaces only accept a pasted compose file and cannot mount a

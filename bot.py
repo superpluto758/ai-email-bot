@@ -8,6 +8,7 @@ senders with Claude. Ported from the Google Apps Script version.
 
 import base64
 import email
+import html
 import json
 import logging
 import os
@@ -117,6 +118,11 @@ IMAP_HOST = os.environ.get("IMAP_HOST", "imap.example.com")
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.example.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 FROM_NAME = os.environ.get("FROM_NAME", "AI Assistant")
+# If a whole cycle stops making progress for this long, something is wedged in
+# a way no timeout caught. Exiting non-zero lets restart:unless-stopped do its
+# job - a healthcheck cannot, because Docker only marks a container unhealthy,
+# it does not restart it.
+WATCHDOG_SECONDS = int(os.environ.get("WATCHDOG_SECONDS", "1800"))
 IMAP_TIMEOUT = 120          # seconds; must exceed nothing but a stalled socket
 IDLE_REFRESH = 240          # re-arm IDLE every 4 min; some servers drop it at 29
 MAX_SEEN_IDS = 3000
@@ -383,6 +389,39 @@ def decode_payload(part):
     return decode_bytes(part.get_payload(decode=True), part.get_content_charset())
 
 
+# Blocks whose CONTENTS must go, not just their tags - stripping only the tags
+# left stylesheet and script source sitting in the middle of the message.
+HTML_DROP_RE = re.compile(
+    r"<(script|style|head|noscript)\b[^>]*>.*?</\1\s*>", re.I | re.S)
+# Tags that end a line of visible text.
+HTML_BREAK_RE = re.compile(
+    r"</?\s*(br|p|div|tr|li|h[1-6]|blockquote|table|ul|ol|hr)\b[^>]*>", re.I)
+
+
+def html_to_text(raw):
+    """Turn an HTML message body into the text a person would see.
+
+    Mail that arrives without a text/plain alternative is ordinary - schools,
+    businesses and anything sent from a CRM. Handing the model the source meant
+    it read markup instead of the question, and with the length cap applied
+    afterwards a long message could be nothing but CSS by the time it arrived."""
+    if not raw:
+        return ""
+    text = HTML_DROP_RE.sub(" ", raw)
+    text = HTML_BREAK_RE.sub("\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = text.replace("\u00a0", " ")
+    # Collapse the whitespace HTML leaves behind, without losing paragraphs.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    # An inline tag mid-sentence (<b>lunch</b>?) becomes a space, which would
+    # otherwise leave "lunch ?" for the model to read.
+    text = re.sub(r" +([,.;:!?%)\]])", r"\1", text)
+    text = re.sub(r"([(\[]) +", r"\1", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def body_text(msg, limit=8000):
     if not msg.is_multipart() and msg.get_content_maintype() != "text":
         return ""          # a bare PDF or image is not the message's text
@@ -395,7 +434,11 @@ def body_text(msg, limit=8000):
         if not any(p.strip() for p in parts):
             for part in msg.walk():
                 if part.get_content_type() == "text/html":
-                    parts.append(re.sub(r"<[^>]+>", " ", decode_payload(part)))
+                    parts.append(html_to_text(decode_payload(part)))
+    elif msg.get_content_subtype() == "html":
+        # A top-level text/html message with no multipart wrapper - this branch
+        # used to hand back the raw source, subject line included.
+        parts.append(html_to_text(decode_payload(msg)))
     else:
         parts.append(decode_payload(msg))
     text = re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip()
@@ -2533,6 +2576,31 @@ def process_unseen(server, state):
 
 # ------------------------------------------------------------------ main ---
 
+def watchdog(state):
+    """Arm a deadman timer, and return a function that resets it."""
+    if not WATCHDOG_SECONDS:
+        return lambda: None
+
+    def expired(_signum, _frame):
+        log.error("no progress for %d seconds - something is wedged. Saving and "
+                  "exiting so the container restarts.", WATCHDOG_SECONDS)
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        os._exit(1)          # deliberately abrupt; unwinding may be what is stuck
+
+    try:
+        signal.signal(signal.SIGALRM, expired)
+    except (ValueError, OSError, AttributeError):
+        return lambda: None
+
+    def kick():
+        signal.alarm(WATCHDOG_SECONDS)
+    kick()
+    return kick
+
+
 def shutdown_cleanly(state):
     """Save and exit on SIGTERM.
 
@@ -2588,6 +2656,7 @@ def main():
     # Written straight away, so the clock survives even if no mail ever arrives.
     save_state(state)
     shutdown_cleanly(state)
+    kick = watchdog(state)
 
     log.info("AI email answerer starting - mailbox=%s via %s | model=%s | "
              "allowlist=%d | recording since %s (start #%d)",
@@ -2630,6 +2699,7 @@ def main():
                     server.idle()
                     responses = server.idle_check(timeout=IDLE_REFRESH)
                     server.idle_done()
+                    kick()          # a completed cycle is proof of life
                     maybe_reports(state)
                     if responses:
                         log.info("new mail signal: %s", responses[:3])
