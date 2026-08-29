@@ -171,6 +171,24 @@ b.call_claude = REAL_CALL_CLAUDE
 out=b.call_claude("claude-sonnet-5","s","hi")
 ok("returns text, not None", out is not None and "wasn't able" in out)
 
+sec("high: the web search tool works on every routable model")
+_cap=[]
+class _R:
+    def __enter__(s): return s
+    def __exit__(s,*a): pass
+    def read(s): return json.dumps({"content":[{"type":"text","text":"ok"}],
+                                    "stop_reason":"end_turn","usage":{}}).encode()
+def _fake(req, timeout=None):
+    _cap.append(json.loads(req.data.decode())); return _R()
+b.urllib.request.urlopen=_fake
+b.call_claude = REAL_CALL_CLAUDE
+for _m in ("claude-haiku-4-5","claude-sonnet-5","claude-opus-5","claude-fable-5"):
+    _cap.clear(); b.call_claude(_m,"sys","hi",web_search=True)
+    _t=_cap[0]["tools"][0]
+    # Without allowed_callers the tool defaults to permitting code-execution
+    # callers, and Haiku 400s rather than ignoring it.
+    ok("search pinned to direct on %-17s" % _m, _t.get("allowed_callers")==["direct"])
+
 sec("medium: state durability")
 src=open(BOT).read()
 ok("fsync before rename", "os.fsync(fh.fileno())" in src)

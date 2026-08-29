@@ -759,8 +759,13 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
     if effort and model not in NO_EFFORT_MODELS:
         payload["output_config"] = {"effort": effort}
     if web_search:
+        # allowed_callers pins the tool to direct calls. Without it the tool
+        # defaults to also being callable from inside code execution, which
+        # Haiku does not support - it returns a 400 rather than ignoring it.
+        # We never use code execution, so "direct" is what we want everywhere.
         payload["tools"] = [{"type": "web_search_20260209",
                              "name": "web_search",
+                             "allowed_callers": ["direct"],
                              "max_uses": 6}]
     if "opus-5" in model:
         betas.append("server-side-fallback-2026-07-01")
