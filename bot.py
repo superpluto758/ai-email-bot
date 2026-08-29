@@ -103,7 +103,7 @@ NO_EFFORT_MODELS = {"claude-haiku-4-5"}
 
 # Policy outcomes where nothing was actually answered. These get the red tag,
 # not the green one: the sender was turned down, not helped.
-REFUSED_CATEGORIES = {"adult", "declined"}
+REFUSED_CATEGORIES = {"adult", "declined", "declined-advice", "declined-distress"}
 
 LABEL_ANSWERED = "ai-answered"
 LABEL_DENIED = "ai-denied"
@@ -127,13 +127,18 @@ FROM_NAME = os.environ.get("FROM_NAME", "AI Assistant")
 # job - a healthcheck cannot, because Docker only marks a container unhealthy,
 # it does not restart it.
 WATCHDOG_SECONDS = int(os.environ.get("WATCHDOG_SECONDS", "1800"))
+# Set once main() arms the watchdog, so the message loop can report progress.
+WATCHDOG_KICK = None
+# Deliberately not persisted: the alert is once per RUN, so a restart tells the
+# owners again rather than leaving them to wonder why mail stopped.
+API_KEY_ALERTED = False
 IMAP_TIMEOUT = 120          # seconds; must exceed nothing but a stalled socket
 IDLE_REFRESH = 240          # re-arm IDLE every 4 min; some servers drop it at 29
 MAX_SEEN_IDS = 3000
 # Fetching every waiting message at once pulls full bodies and attachments into
 # memory in one go. After a long outage that is gigabytes on a NAS sharing RAM
 # with other containers, and the OOM kill just restarts the same fetch.
-MAX_BATCH = 40
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "20"))
 MAX_HELD = 200              # deferred messages remembered across scans
 
 # Abuse-safety limits. Repeatedly retrying a rejected login looks exactly like
@@ -178,7 +183,7 @@ def load_state():
         "sent_times": [],
         "send_failures": {},
         "reply_failures": {},    # message id -> refused generation attempts
-        "api_key_alerted": False, # a rejected key is reported once, not per message
+
         "usage": {},
         "spend": {},              # month -> {in, out, searches, usd}
         "spend_week": {},         # ISO week -> same shape
@@ -790,12 +795,19 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
                 data = json.loads(resp.read().decode())
             _note_usage(model, data)
         except urllib.error.HTTPError as exc:
-            log.error("Claude API %s: %s", exc.code, exc.read()[:400])
-            if exc.code in (401, 403):
+            body = exc.read()[:400]
+            log.error("Claude API %s: %s", exc.code, body)
+            if exc.code == 401 or (exc.code == 403 and b"authentication" in body):
                 # A bad or revoked key fails identically every time. Retrying it
                 # three times per message and then telling the owner their
                 # attachment was "damaged in transit" wastes calls and gives the
                 # wrong diagnosis.
+                #
+                # A plain 403 is NOT this: it usually means the account cannot
+                # use the requested model, which an admin can cause by email
+                # ("use fable"). That must fall through to the ordinary retry
+                # path so it gets flagged, rather than silently holding all mail
+                # behind an alert that blames the API key.
                 LAST_CALL["auth_error"] = exc.code
                 log.error("the ANTHROPIC_API_KEY is not being accepted - mail "
                           "will be held, not answered, until it is corrected")
@@ -1521,7 +1533,11 @@ NON_ADMIN_POLICY = (
     "nothing unusual happened.\n"
     " IMPORTANT: you must return the JSON object below even when you are "
     "refusing. Put your refusal in the \"reply\" field and set \"category\" to "
-    "\"adult\". Answering with a bare refusal and no JSON means the owner is "
+    "the category that actually fits - \"adult\" for explicit material, "
+    "\"distress\" for someone in crisis, \"advice\" for medical, legal or "
+    "financial. Never label a distressed person's message \"adult\"; they would "
+    "be told they had been blocked. Answering with a bare refusal and no JSON "
+    "means the owner is "
     "never told the request was made, which defeats the point of this policy.\n"
     "Respond with ONLY a JSON object, no code fences: "
     '{"category": "adult"|"advice"|"distress"|"normal", '
@@ -1829,12 +1845,24 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
 # returning a classification. Deliberately narrow - matched against the reply
 # we are about to send, not against anything the sender wrote.
 DECLINE_RE = re.compile(
-    r"\bi\s*['\u2019]?m\s+(not\s+able|not\s+going|unable)"
-    r"|\bi\s+(can\s*not|can['\u2019]?t|cannot|won['\u2019]?t|will\s+not"
-    r"|am\s+not\s+able|am\s+unable"
-    r"|do\s*n['\u2019]?t\s+(write|produce|generate|create|help)"
-    r"|do\s+not\s+(write|produce|generate|create|help))"
-    r"|\bnot\s+something\s+i\b", re.I)
+    r"^\W{0,20}(sorry[,. ]{0,3})?"
+    r"(i\s*['\u2019]?m\s+(not\s+able\s+to|not\s+going\s+to|unable\s+to|sorry)"
+    r"|i\s+(can\s*not|can['\u2019]?t|cannot|won['\u2019]?t|will\s+not"
+    r"|am\s+not\s+able\s+to|am\s+unable\s+to"
+    r"|do\s*n['\u2019]?t|do\s+not)"
+    r"|that\s*['\u2019]?s\s+not\s+something\s+i)"
+    # ...and the refusal has to actually refuse something. Without this,
+    # "I can't stress enough how useful past papers are" was read as a decline.
+    r"\s*(['\u2019]ll|can|could|will|would|am\s+able\s+to|be\s+able\s+to)?\s*"
+    r"(help|assist|do\s+that|do\s+this|write|produce|generate|create|provide"
+    r"|answer|engage|comply|take\s+that\s+on)\b", re.I)
+
+# A refusal is short and says no at the very start. An answer that merely
+# contains "I can't" somewhere in the middle - "the tricky part is that I can't
+# tell from your description whether..." - is an answer, and treating it as a
+# refusal tagged it red, told the owner nothing was answered, and could replace
+# it with the adult block notice.
+DECLINE_MAX_CHARS = 400
 
 
 DECLINE_CATEGORY_PROMPT = (
@@ -1855,18 +1883,34 @@ def classify_decline(question):
     One cheap call recovers it. Only runs on a refusal, which is rare."""
     if not question or not question.strip():
         return {}
-    prior_model = LAST_CALL.get("model")
+    # The expensive call that was refused is still sitting in LAST_CALL and has
+    # not been billed yet. _note_usage accumulates, so this cheap call's tokens
+    # would simply be added and the whole lot relabelled "haiku" - losing most
+    # of the real cost. Snapshot, then restore and merge.
+    before = {"model": LAST_CALL.get("model"),
+              "usage": dict(LAST_CALL.get("usage") or {}),
+              "searches": LAST_CALL.get("searches", 0),
+              "refusal": LAST_CALL.get("refusal"),
+              "auth_error": LAST_CALL.get("auth_error")}
     try:
         raw = call_claude(TRIVIAL_MODEL or "claude-haiku-4-5",
                           DECLINE_CATEGORY_PROMPT, question[:2000], max_tokens=300)
     except Exception as exc:
         log.warning("could not categorise a refusal: %s", exc)
-        return {}
+        raw = None
     finally:
-        # Bill the whole exchange at the dearer model's rate rather than
-        # letting this cheap call relabel it.
-        if prior_model:
-            LAST_CALL["model"] = prior_model
+        # _note_usage accumulates, so LAST_CALL already holds BOTH calls'
+        # tokens by now. Keep that total, but put back the dearer model's name
+        # and the flags the recovery call would otherwise have erased - billing
+        # the cheap call at the dear rate rather than losing the dear one.
+        combined_usage = dict(LAST_CALL.get("usage") or {}) or before["usage"]
+        combined_searches = max(LAST_CALL.get("searches", 0), before["searches"])
+        LAST_CALL.clear()
+        LAST_CALL.update({k: v for k, v in before.items() if v})
+        LAST_CALL["usage"] = combined_usage
+        LAST_CALL["searches"] = combined_searches
+    if raw is None:
+        return {}
     return parse_json(raw) or {}
 
 
@@ -1927,7 +1971,9 @@ def apply_policy(raw, sender, from_header, subject, received, question=""):
         # the one case the owners most need to hear about. An adult request
         # was declined in prose and reported to nobody.
         refused_by_api = LAST_CALL.get("refusal")
-        declined = bool(refused_by_api) or bool(DECLINE_RE.search(raw or ""))
+        declined = bool(refused_by_api) or (
+            len((raw or "").strip()) <= DECLINE_MAX_CHARS
+            and bool(DECLINE_RE.match((raw or "").strip())))
         if declined:
             recovered = classify_decline(question)
             cat = str(recovered.get("category") or "").lower()
@@ -1935,6 +1981,9 @@ def apply_policy(raw, sender, from_header, subject, received, question=""):
                 ("refused by the safety system (%s)" % refused_by_api)
                 if refused_by_api else
                 "the model declined without saying what was asked")
+            # However it is categorised, nothing was answered - so the message
+            # must not be tagged green. The category describes the topic; this
+            # says what happened to it.
             if cat == "adult":
                 # Say plainly that it was blocked, in the assistant's own fixed
                 # words - the model's ad-hoc refusal reads like a limitation
@@ -1944,7 +1993,7 @@ def apply_policy(raw, sender, from_header, subject, received, question=""):
                     reason,
                     "They were told it was blocked automatically.")]
             return raw, [entry(
-                cat if cat in ("advice", "distress") else "declined",
+                "declined-" + cat if cat in ("advice", "distress") else "declined",
                 "the request was refused; nothing was answered", reason,
                 "The sender was turned down. The category above was worked out "
                 "after the fact, because the refusal came back as plain prose "
@@ -2313,6 +2362,12 @@ def process_unseen(server, state):
             state["seen_ids"].append(msg_id)
             record_usage(state, sender)
             dirty = True
+            # Progress. Without this a long batch - up to MAX_BATCH messages,
+            # each with a reply delay and possibly a web search - looks
+            # identical to a wedged process, and the watchdog kills it
+            # mid-flight, losing whatever was in hand.
+            if WATCHDOG_KICK:
+                WATCHDOG_KICK()
 
             if not in_list(sender, state["allowlist"]):
                 # Never reply. Colour-code only; leave read state alone.
@@ -2548,8 +2603,8 @@ def process_unseen(server, state):
                     # Not this message's fault, and not something more attempts
                     # can fix. Hold it for when the key works again, rather than
                     # spending three calls and then blaming their attachment.
-                    if not state.get("api_key_alerted"):
-                        state["api_key_alerted"] = True
+                    global API_KEY_ALERTED
+                    if not API_KEY_ALERTED:
                         try:
                             record_send(state)
                             send_mail(notify_admins(),
@@ -2562,6 +2617,7 @@ def process_unseen(server, state):
                                       "will be answered.\n\nSent once per restart, "
                                       "not once per message."
                                       % LAST_CALL["auth_error"])
+                            API_KEY_ALERTED = True     # only once it is away
                         except Exception as exc2:
                             log.error("could not send the API key alert: %s", exc2)
                     state["seen_ids"].remove(msg_id)
@@ -2640,7 +2696,7 @@ def process_unseen(server, state):
 
             state.get("send_failures", {}).pop(msg_id, None)
             state.get("reply_failures", {}).pop(msg_id, None)
-            state["api_key_alerted"] = False      # the key is working again
+            API_KEY_ALERTED = False               # the key is working again
             record_send(state)
             record_reply_to(state, sender)
             record_last_call(state, sender)
@@ -2745,6 +2801,11 @@ def watchdog(state):
 
     def kick():
         signal.alarm(WATCHDOG_SECONDS)
+
+    def stop():
+        signal.alarm(0)
+
+    kick.stop = stop
     kick()
     return kick
 
@@ -2804,7 +2865,9 @@ def main():
     # Written straight away, so the clock survives even if no mail ever arrives.
     save_state(state)
     shutdown_cleanly(state)
+    global WATCHDOG_KICK
     kick = watchdog(state)
+    WATCHDOG_KICK = kick
 
     log.info("AI email answerer starting - mailbox=%s via %s | model=%s | "
              "allowlist=%d | recording since %s (start #%d)",
@@ -2848,6 +2911,10 @@ def main():
                     responses = server.idle_check(timeout=IDLE_REFRESH)
                     server.idle_done()
                     kick()          # a completed cycle is proof of life
+                    # Also record it on disk: the healthcheck reads last_active,
+                    # and on a quiet mailbox nothing else touches it, so a
+                    # perfectly healthy bot was being reported unhealthy.
+                    save_state(state)
                     maybe_reports(state)
                     if responses:
                         log.info("new mail signal: %s", responses[:3])
@@ -2876,6 +2943,14 @@ def main():
                     log.error("Check MAIL_ADDRESS and MAIL_PASSWORD, then "
                               "redeploy this project to start again.")
                     log.error("=" * 66)
+                    # Disarm the watchdog first. It would otherwise fire in
+                    # here, exit non-zero, and restart:unless-stopped would
+                    # bring the container straight back to make another five
+                    # rejected logins - every WATCHDOG_SECONDS, indefinitely.
+                    # That is precisely the credential-stuffing pattern this
+                    # halt was written to avoid.
+                    if getattr(kick, "stop", None):
+                        kick.stop()
                     while True:            # idle forever; no further logins
                         time.sleep(3600)
             else:

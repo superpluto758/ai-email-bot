@@ -115,7 +115,7 @@ services:
 
     # A ceiling, so a large backlog cannot take the host down with it. The bot
     # idles around 25 MB.
-    mem_limit: 512m
+    mem_limit: 1g
 
     logging:
       driver: json-file

@@ -215,7 +215,10 @@ ok("action says blocked", "BLOCKED" in _al[0]["action"])
 for _c in ("advice", "distress"):
     b.call_claude = _stub(_c, "recorded reason"); b.LAST_CALL.clear()
     _r2, _a2 = b.apply_policy(_REF, _U, "T", "", _now, question="q")
-    ok("refusal categorised as %-9s" % _c, _a2 and _a2[0]["category"] == _c)
+    ok("refusal categorised as %-9s" % _c,
+       _a2 and _a2[0]["category"] == "declined-" + _c)
+    ok("refused %-9s is tagged red" % _c,
+       _a2 and _a2[0]["category"] in b.REFUSED_CATEGORIES)
     ok("no blocked notice for %-9s" % _c, not _r2.startswith("Your message was blocked"))
 b.call_claude = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
 b.LAST_CALL.clear()
@@ -224,12 +227,32 @@ ok("recovery failure still alerts", _a3 and _a3[0]["category"] == "declined")
 
 sec("high: a rejected API key holds mail instead of abandoning it")
 _src = open(BOT).read()          # the module under test, wherever it lives
-ok("401 and 403 are recognised", 'exc.code in (401, 403)' in _src)
+# A 401 is a bad key. A bare 403 usually means the account cannot use the
+# requested model - which an admin can cause by email - so it must NOT put the
+# bot into an indefinite hold blaming the compose file.
+ok("401 is treated as a key failure", 'exc.code == 401' in _src)
+ok("403 only counts when it says authentication",
+   'exc.code == 403 and b"authentication" in body' in _src)
 ok("the key failure is recorded", 'LAST_CALL["auth_error"]' in _src)
 ok("mail is held on an auth error", 'holding %s - the API key is being rejected' in _src)
-ok("owners are alerted once, not per message", 'api_key_alerted' in _src)
-ok("the flag clears once it works again",
-   'state["api_key_alerted"] = False' in _src)
+ok("the alert flag is NOT persisted", '"api_key_alerted"' not in _src)
+ok("alerted once per run", 'API_KEY_ALERTED' in _src)
+ok("flagged only after the alert is away", 'API_KEY_ALERTED = True     # only once it is away' in _src)
+ok("flag clears when it works again", 'API_KEY_ALERTED = False' in _src)
+
+# The watchdog must never restart the deliberate login halt, and must be told
+# about progress during a long batch.
+ok("watchdog can be disarmed", 'kick.stop = stop' in _src)
+ok("disarmed before the login halt", 'kick.stop()' in _src)
+ok("kicked during a batch", 'WATCHDOG_KICK()' in _src)
+ok("liveness refreshed while idle", 'the healthcheck reads last_active' in _src)
+
+# Refusal detection must be anchored and bounded, or ordinary answers are
+# tagged red and can be replaced by the adult block notice.
+ok("refusal match is anchored", 'DECLINE_RE.match(' in _src)
+ok("refusal length is bounded", 'DECLINE_MAX_CHARS' in _src)
+ok("a refusal is always red whatever its topic",
+   {"declined-advice", "declined-distress"} <= b.REFUSED_CATEGORIES)
 
 sec("high: a refused message is tagged red, not green")
 ok("adult is a refused category", "adult" in b.REFUSED_CATEGORIES)
