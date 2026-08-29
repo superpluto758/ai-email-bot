@@ -1828,6 +1828,39 @@ DECLINE_RE = re.compile(
     r"|\bnot\s+something\s+i\b", re.I)
 
 
+DECLINE_CATEGORY_PROMPT = (
+    "An email assistant refused a request. Your only job is to record what was "
+    "asked, for the owner's log. You are NOT being asked to fulfil it. "
+    "Respond with ONLY a JSON object, no code fences: "
+    '{"category": "adult"|"advice"|"distress"|"other", '
+    '"reason": "one short factual line naming what they asked for, no verbatim '
+    'quotes"}')
+
+
+def classify_decline(question):
+    """Work out what a refused request actually was.
+
+    When the model refuses it answers in prose, so the category the content
+    policy would have returned is lost - leaving the owner with "declined" and
+    no idea whether it was explicit material, a medical question or a crisis.
+    One cheap call recovers it. Only runs on a refusal, which is rare."""
+    if not question or not question.strip():
+        return {}
+    prior_model = LAST_CALL.get("model")
+    try:
+        raw = call_claude(TRIVIAL_MODEL or "claude-haiku-4-5",
+                          DECLINE_CATEGORY_PROMPT, question[:2000], max_tokens=300)
+    except Exception as exc:
+        log.warning("could not categorise a refusal: %s", exc)
+        return {}
+    finally:
+        # Bill the whole exchange at the dearer model's rate rather than
+        # letting this cheap call relabel it.
+        if prior_model:
+            LAST_CALL["model"] = prior_model
+    return parse_json(raw) or {}
+
+
 def looks_like_json(text):
     """Does this look like a JSON envelope we failed to parse, or real prose?"""
     t = (text or "").lstrip().lstrip("`json").lstrip()
@@ -1848,7 +1881,7 @@ BLOCKED_NOTICE = (
     "If you think this was a mistake, contact the owner of this address.")
 
 
-def apply_policy(raw, sender, from_header, subject, received):
+def apply_policy(raw, sender, from_header, subject, received, question=""):
     """Turn a non-admin's classified reply into (reply text, [alerts]).
 
     A message can raise more than one alert - trying to change a setting is
@@ -1887,17 +1920,26 @@ def apply_policy(raw, sender, from_header, subject, received):
         refused_by_api = LAST_CALL.get("refusal")
         declined = bool(refused_by_api) or bool(DECLINE_RE.search(raw or ""))
         if declined:
-            return raw, [entry(
-                "declined",
-                "the request was refused; nothing was answered",
+            recovered = classify_decline(question)
+            cat = str(recovered.get("category") or "").lower()
+            reason = recovered.get("reason") or (
                 ("refused by the safety system (%s)" % refused_by_api)
                 if refused_by_api else
-                "the model declined in its own words rather than returning a "
-                "classification, so the exact category is not recorded",
-                "The sender was turned down - that part worked. This alert "
-                "exists because the refusal bypassed the usual classification, "
-                "so check the message yourself if you want to know what was "
-                "asked.")]
+                "the model declined without saying what was asked")
+            if cat == "adult":
+                # Say plainly that it was blocked, in the assistant's own fixed
+                # words - the model's ad-hoc refusal reads like a limitation
+                # rather than a decision, and the sender should know which it is.
+                return BLOCKED_NOTICE, [entry(
+                    "adult", "BLOCKED - nothing in the message was answered",
+                    reason,
+                    "They were told it was blocked automatically.")]
+            return raw, [entry(
+                cat if cat in ("advice", "distress") else "declined",
+                "the request was refused; nothing was answered", reason,
+                "The sender was turned down. The category above was worked out "
+                "after the fact, because the refusal came back as plain prose "
+                "rather than a classification.")]
         return raw, [entry(
             "unclassified",
             "answered, but without a policy verdict",
@@ -2475,7 +2517,8 @@ def process_unseen(server, state):
                 raw_reply = answer_normally(state, thread_text, attachments, sender,
                                             question=own_text or subject)
                 reply, policy_alerts = apply_policy(
-                    raw_reply, sender, msg.get("From", sender), subject, received)
+                    raw_reply, sender, msg.get("From", sender), subject, received,
+                    question=own_text or subject)
                 for entry in policy_alerts:
                     log.info("content policy: %s from %s - %s",
                              entry["category"], sender, entry["action"])

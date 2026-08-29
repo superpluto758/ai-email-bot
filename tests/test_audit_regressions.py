@@ -196,6 +196,32 @@ _, _a = b.apply_policy("Napoleon entered Moscow in 1812.", _U,"T","s",_now)
 ok("a plain answer is never called a refusal", _a and _a[0]["category"] == "unclassified")
 ok("no non-admin reply leaves without a verdict", bool(_a))
 
+sec("critical: a refusal is categorised and the sender is told they are blocked")
+_Q = "Describe an explicit sexual encounter between two consenting adults"
+_REF = "I can't write explicit sexual content. Happy to help with something else."
+def _stub(cat, reason):
+    def f(model, system, content, **k):
+        if "record what was asked" in system:
+            return json.dumps({"category": cat, "reason": reason})
+        return _REF
+    return f
+b.call_claude = _stub("adult", "asked for a graphic sexual description")
+b.LAST_CALL.clear()
+_rep, _al = b.apply_policy(_REF, _U, "T", "", _now, question=_Q)
+ok("sender is told it was blocked", _rep.startswith("Your message was blocked"))
+ok("owner gets the real category", _al and _al[0]["category"] == "adult")
+ok("owner gets a real reason", "sexual" in _al[0]["reason"])
+ok("action says blocked", "BLOCKED" in _al[0]["action"])
+for _c in ("advice", "distress"):
+    b.call_claude = _stub(_c, "recorded reason"); b.LAST_CALL.clear()
+    _r2, _a2 = b.apply_policy(_REF, _U, "T", "", _now, question="q")
+    ok("refusal categorised as %-9s" % _c, _a2 and _a2[0]["category"] == _c)
+    ok("no blocked notice for %-9s" % _c, not _r2.startswith("Your message was blocked"))
+b.call_claude = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+b.LAST_CALL.clear()
+_r3, _a3 = b.apply_policy(_REF, _U, "T", "", _now, question=_Q)
+ok("recovery failure still alerts", _a3 and _a3[0]["category"] == "declined")
+
 sec("high: a refused message is tagged red, not green")
 ok("adult is a refused category", "adult" in b.REFUSED_CATEGORIES)
 ok("declined is a refused category", "declined" in b.REFUSED_CATEGORIES)
