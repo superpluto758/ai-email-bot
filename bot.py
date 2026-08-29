@@ -101,6 +101,10 @@ ADMIN_EFFORT = {
 # Haiku 4.5 rejects output_config.effort outright, so it must never be sent.
 NO_EFFORT_MODELS = {"claude-haiku-4-5"}
 
+# Policy outcomes where nothing was actually answered. These get the red tag,
+# not the green one: the sender was turned down, not helped.
+REFUSED_CATEGORIES = {"adult", "declined"}
+
 LABEL_ANSWERED = "ai-answered"
 LABEL_DENIED = "ai-denied"
 LABEL_SKIPPED = "ai-skipped"
@@ -2548,7 +2552,13 @@ def process_unseen(server, state):
             # the tag being applied or the mail being marked read, or a failure
             # there leaves the message looking unanswered and gets it replied
             # to twice.
-            label(server, uid, LABEL_ANSWERED)
+            # Green means answered. A message we refused was not answered, so
+            # it belongs in red with the other denials - seeing an explicit
+            # request sitting in the inbox tagged "answered" is alarming and
+            # wrong.
+            refused = any(a.get("category") in REFUSED_CATEGORIES
+                          for a in policy_alerts)
+            label(server, uid, LABEL_DENIED if refused else LABEL_ANSWERED)
             mark_seen(server, uid)
 
             state.get("send_failures", {}).pop(msg_id, None)

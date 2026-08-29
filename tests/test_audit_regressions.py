@@ -196,6 +196,15 @@ _, _a = b.apply_policy("Napoleon entered Moscow in 1812.", _U,"T","s",_now)
 ok("a plain answer is never called a refusal", _a and _a[0]["category"] == "unclassified")
 ok("no non-admin reply leaves without a verdict", bool(_a))
 
+sec("high: a refused message is tagged red, not green")
+ok("adult is a refused category", "adult" in b.REFUSED_CATEGORIES)
+ok("declined is a refused category", "declined" in b.REFUSED_CATEGORIES)
+ok("advice is answered, so not refused", "advice" not in b.REFUSED_CATEGORIES)
+ok("distress is answered, so not refused", "distress" not in b.REFUSED_CATEGORIES)
+ok("an admin attempt is answered normally",
+   "admin attempt" not in b.REFUSED_CATEGORIES)
+ok("unclassified is answered", "unclassified" not in b.REFUSED_CATEGORIES)
+
 sec("high: the web search tool works on every routable model")
 _cap=[]
 class _R:

@@ -293,9 +293,12 @@ colour-coded on the message itself:
 
 | Tag | Meaning |
 |---|---|
-| `ai-answered` | replied to |
-| `ai-denied` | a real person wrote in and was not answered — **you are alerted** |
+| `ai-answered` | the question was answered |
+| `ai-denied` | not answered — a stranger, or a request refused under the content policy. **You are alerted** either way |
 | `ai-skipped` | bulk, automated, or nothing to answer |
+
+Medical, legal and distress messages stay green: those *are* answered, just
+carefully. Only outright refusals go red.
 
 Obvious bulk mail is filtered in code first, for free — no-reply addresses,
 `List-Unsubscribe`, `Precedence: bulk`, `Auto-Submitted`. Only what survives
