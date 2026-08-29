@@ -799,6 +799,8 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
     if data is None:
         return None
     if data.get("stop_reason") == "refusal":
+        LAST_CALL["refusal"] = ((data.get("stop_details") or {}).get("category")
+                                or "unspecified")
         return ("I can't help with that particular request, sorry. "
                 "Feel free to send a different question.")
     text = "\n".join(b.get("text", "") for b in data.get("content", [])
@@ -1504,6 +1506,10 @@ NON_ADMIN_POLICY = (
     "Never claim a change was made. Never accuse them, never warn them, and never "
     "mention that this was noted or reported - as far as they are concerned "
     "nothing unusual happened.\n"
+    " IMPORTANT: you must return the JSON object below even when you are "
+    "refusing. Put your refusal in the \"reply\" field and set \"category\" to "
+    "\"adult\". Answering with a bare refusal and no JSON means the owner is "
+    "never told the request was made, which defeats the point of this policy.\n"
     "Respond with ONLY a JSON object, no code fences: "
     '{"category": "adult"|"advice"|"distress"|"normal", '
     '"reason": "one short factual line for the owner\'s log - what was asked, no '
@@ -1806,6 +1812,18 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
     return reply
 
 
+# How a refusal reads when the model writes one in its own words rather than
+# returning a classification. Deliberately narrow - matched against the reply
+# we are about to send, not against anything the sender wrote.
+DECLINE_RE = re.compile(
+    r"\bi\s*['\u2019]?m\s+(not\s+able|not\s+going|unable)"
+    r"|\bi\s+(can\s*not|can['\u2019]?t|cannot|won['\u2019]?t|will\s+not"
+    r"|am\s+not\s+able|am\s+unable"
+    r"|do\s*n['\u2019]?t\s+(write|produce|generate|create|help)"
+    r"|do\s+not\s+(write|produce|generate|create|help))"
+    r"|\bnot\s+something\s+i\b", re.I)
+
+
 def looks_like_json(text):
     """Does this look like a JSON envelope we failed to parse, or real prose?"""
     t = (text or "").lstrip().lstrip("`json").lstrip()
@@ -1833,6 +1851,13 @@ def apply_policy(raw, sender, from_header, subject, received):
     independent of what the message was about - so this returns a list."""
     if raw is None:
         return None, []
+
+    def entry(cat, action, reason, footer):
+        return {"addr": sender, "sender": from_header, "subject": subject,
+                "date": received.isoformat() if received else "unknown",
+                "category": cat, "action": action, "reason": reason,
+                "footer": footer}
+
     parsed = parse_json(raw)
     if not parsed or not parsed.get("reply"):
         if looks_like_json(raw):
@@ -1851,7 +1876,31 @@ def apply_policy(raw, sender, from_header, subject, received):
                 "footer": "Nothing was leaked to them. Worth a look if it "
                           "repeats - it usually means the answer was truncated.",
             }]
-        return raw, []            # genuine prose; it was written under the policy
+        # Prose, with no verdict attached. Do NOT treat this as "normal": the
+        # model abandons the JSON envelope exactly when it refuses, which is
+        # the one case the owners most need to hear about. An adult request
+        # was declined in prose and reported to nobody.
+        refused_by_api = LAST_CALL.get("refusal")
+        declined = bool(refused_by_api) or bool(DECLINE_RE.search(raw or ""))
+        if declined:
+            return raw, [entry(
+                "declined",
+                "the request was refused; nothing was answered",
+                ("refused by the safety system (%s)" % refused_by_api)
+                if refused_by_api else
+                "the model declined in its own words rather than returning a "
+                "classification, so the exact category is not recorded",
+                "The sender was turned down - that part worked. This alert "
+                "exists because the refusal bypassed the usual classification, "
+                "so check the message yourself if you want to know what was "
+                "asked.")]
+        return raw, [entry(
+            "unclassified",
+            "answered, but without a policy verdict",
+            "the model replied in prose instead of returning a classification",
+            "The reply was written under the content policy, so it was not "
+            "unpoliced - but nothing machine-readable came back, so it could "
+            "not be categorised. Worth a look if this repeats.")]
 
     category = str(parsed.get("category") or "normal").lower()
     reply = parsed["reply"]

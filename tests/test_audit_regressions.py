@@ -171,6 +171,31 @@ b.call_claude = REAL_CALL_CLAUDE
 out=b.call_claude("claude-sonnet-5","s","hi")
 ok("returns text, not None", out is not None and "wasn't able" in out)
 
+sec("critical: a decline is never silent")
+_now = __import__("datetime").datetime.now()
+_U = "tester@example.com"
+# The real case: an 18+ request was declined by the model in its own words,
+# the sender got a decline, and the owners were told nothing at all - because
+# the whole alerting scheme relied on a JSON envelope the model abandons
+# precisely when it refuses.
+b.LAST_CALL.clear()
+_r, _al = b.apply_policy("I can't write explicit sexual content. Happy to help "
+                         "with something else if you'd like.", _U, "T", "s", _now)
+ok("prose refusal now alerts", _al and _al[0]["category"] == "declined")
+ok("the sender still gets the decline", "can't write explicit" in _r)
+for _phr in ["I'm not able to help with that.", "I won't write that.",
+             "I cannot generate that.", "That's not something I'll help with."]:
+    b.LAST_CALL.clear()
+    _, _a = b.apply_policy(_phr, _U, "T", "s", _now)
+    ok("decline detected: %-34s" % _phr[:34], _a and _a[0]["category"] == "declined")
+b.LAST_CALL.clear(); b.LAST_CALL["refusal"] = "cyber"
+_, _a = b.apply_policy("I can't help with that particular request, sorry.", _U,"T","s",_now)
+ok("API-level refusal alerts", _a and "safety system" in _a[0]["reason"])
+b.LAST_CALL.clear()
+_, _a = b.apply_policy("Napoleon entered Moscow in 1812.", _U,"T","s",_now)
+ok("a plain answer is never called a refusal", _a and _a[0]["category"] == "unclassified")
+ok("no non-admin reply leaves without a verdict", bool(_a))
+
 sec("high: the web search tool works on every routable model")
 _cap=[]
 class _R:
