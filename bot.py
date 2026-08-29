@@ -178,6 +178,7 @@ def load_state():
         "sent_times": [],
         "send_failures": {},
         "reply_failures": {},    # message id -> refused generation attempts
+        "api_key_alerted": False, # a rejected key is reported once, not per message
         "usage": {},
         "spend": {},              # month -> {in, out, searches, usd}
         "spend_week": {},         # ISO week -> same shape
@@ -790,6 +791,14 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
             _note_usage(model, data)
         except urllib.error.HTTPError as exc:
             log.error("Claude API %s: %s", exc.code, exc.read()[:400])
+            if exc.code in (401, 403):
+                # A bad or revoked key fails identically every time. Retrying it
+                # three times per message and then telling the owner their
+                # attachment was "damaged in transit" wastes calls and gives the
+                # wrong diagnosis.
+                LAST_CALL["auth_error"] = exc.code
+                log.error("the ANTHROPIC_API_KEY is not being accepted - mail "
+                          "will be held, not answered, until it is corrected")
             return None
         except Exception as exc:
             log.error("Claude API call failed: %s", exc)
@@ -2535,6 +2544,31 @@ def process_unseen(server, state):
                 # The API would not answer. Usually transient, so retry - but
                 # cap it: a corrupt attachment fails identically every time,
                 # and each attempt is billed.
+                if LAST_CALL.get("auth_error"):
+                    # Not this message's fault, and not something more attempts
+                    # can fix. Hold it for when the key works again, rather than
+                    # spending three calls and then blaming their attachment.
+                    if not state.get("api_key_alerted"):
+                        state["api_key_alerted"] = True
+                        try:
+                            record_send(state)
+                            send_mail(notify_admins(),
+                                      "%s the API key is being rejected" % FLAG_PREFIX,
+                                      "The Anthropic API is returning %s for every "
+                                      "request, so nothing can be answered.\n\n"
+                                      "Mail is being held rather than refused - once "
+                                      "the key in the compose file is corrected and "
+                                      "the container redeployed, everything waiting "
+                                      "will be answered.\n\nSent once per restart, "
+                                      "not once per message."
+                                      % LAST_CALL["auth_error"])
+                        except Exception as exc2:
+                            log.error("could not send the API key alert: %s", exc2)
+                    state["seen_ids"].remove(msg_id)
+                    retry.add(uid)
+                    log.warning("holding %s - the API key is being rejected", sender)
+                    continue
+
                 record_last_call(state, sender)   # a refused generation still cost
                 tries = state.setdefault("reply_failures", {})
                 tries[msg_id] = tries.get(msg_id, 0) + 1
@@ -2606,6 +2640,7 @@ def process_unseen(server, state):
 
             state.get("send_failures", {}).pop(msg_id, None)
             state.get("reply_failures", {}).pop(msg_id, None)
+            state["api_key_alerted"] = False      # the key is working again
             record_send(state)
             record_reply_to(state, sender)
             record_last_call(state, sender)

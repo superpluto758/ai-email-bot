@@ -222,6 +222,15 @@ b.LAST_CALL.clear()
 _r3, _a3 = b.apply_policy(_REF, _U, "T", "", _now, question=_Q)
 ok("recovery failure still alerts", _a3 and _a3[0]["category"] == "declined")
 
+sec("high: a rejected API key holds mail instead of abandoning it")
+_src = open(BOT).read()          # the module under test, wherever it lives
+ok("401 and 403 are recognised", 'exc.code in (401, 403)' in _src)
+ok("the key failure is recorded", 'LAST_CALL["auth_error"]' in _src)
+ok("mail is held on an auth error", 'holding %s - the API key is being rejected' in _src)
+ok("owners are alerted once, not per message", 'api_key_alerted' in _src)
+ok("the flag clears once it works again",
+   'state["api_key_alerted"] = False' in _src)
+
 sec("high: a refused message is tagged red, not green")
 ok("adult is a refused category", "adult" in b.REFUSED_CATEGORIES)
 ok("declined is a refused category", "declined" in b.REFUSED_CATEGORIES)
