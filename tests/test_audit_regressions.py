@@ -41,8 +41,21 @@ sec("critical: our own alerts are not commands")
 def m(subj, frm=ADMIN):
     x=email.message.EmailMessage(); x["From"]=frm; x["Subject"]=subj; x.set_content("hi")
     return email.message_from_bytes(x.as_bytes())
-for s_ in ["[AI Flag] x","Re: [AI Flag] x","RE: [AI Flag] x","Fwd: [AI Flag] x"]:
-    ok("ignored: %-16s" % s_, b.FLAG_PREFIX in b.header(m(s_),"Subject"))
+# Our own alerts must be ignored - but a REPLY to one is a legitimate admin
+# message, and replying to a flag with "add them to the allowlist" is the most
+# natural way to use this. Matching the prefix anywhere broke that outright.
+for s_, want in [("[AI Flag] x", True), ("[AI Flag] admin attempt", True),
+                 ("Re: [AI Flag] x", False), ("RE: [AI Flag] x", False),
+                 ("Fwd: [AI Flag] x", False), ("a normal question", False)]:
+    ok("self-ignore %-26s" % s_, b.header(m(s_),"Subject").startswith(b.FLAG_PREFIX) == want)
+
+# and the reply path must still work end to end
+typed = "add flagged-person@example.com to the allowlist"
+_st = b.load_state()
+b.call_claude = lambda *a, **k: json.dumps({"add":["flagged-person@example.com"],"reply":"Added."})
+_r = b.handle_admin(_st, typed + "\n\n> Quote: \"hello\"", sender=ADMIN, own_text=typed)
+ok("replying to a flag can allowlist someone",
+   b.in_list("flagged-person@example.com", _st["allowlist"]))
 
 sec("critical: a deferred message survives the first scan")
 def mk(mid, frm=USER):

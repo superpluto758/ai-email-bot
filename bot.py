@@ -2178,7 +2178,13 @@ def process_unseen(server, state):
             if (normalize(sender) == normalize(SELF)
                     or msg.get("X-AI-Bot")
                     or BOT_MARKER in own_text          # older replies, still quoted
-                    or FLAG_PREFIX in subject):
+                    # Only OUR OWN alert, not a reply to one. Matching the
+                    # prefix anywhere threw away the most natural admin action
+                    # there is - replying to a flag with "add them to the
+                    # allowlist". Injection through the quoted alert is handled
+                    # separately, by requiring the address to appear in what the
+                    # admin actually typed.
+                    or subject.startswith(FLAG_PREFIX)):
                 log.info("ignoring our own message from %s", sender)
                 state["seen_ids"].append(msg_id)
                 mark_seen(server, uid)
