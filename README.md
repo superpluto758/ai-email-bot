@@ -374,6 +374,8 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` | | Remembering people between emails |
 | `REPLY_DELAY_MIN` / `REPLY_DELAY_MAX` | | Random delay, seconds |
 | `AUTH_FAIL_LIMIT` | | Rejected logins before it stops |
+| `MAX_BATCH` | | Messages fetched per pass, default 20; raise `mem_limit` alongside it |
+| `WATCHDOG_SECONDS` | | No progress for this long and it restarts itself, default 1800; `0` disables |
 | `TZ`, `STATE_PATH` | | Timezone, state file location |
 | `PYTHONUTF8`, `LANG` | | Keep `£`, accents and non-Latin scripts intact |
 

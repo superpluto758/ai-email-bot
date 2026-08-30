@@ -64,6 +64,17 @@ services:
       PYTHONUTF8: "1"
       LANG: "C.UTF-8"
 
+      # How many waiting messages to pull in one pass. Each is fetched whole,
+      # attachments and all, so a long backlog can be a lot of memory at once.
+      # Keep mem_limit comfortably above this times your largest message.
+      MAX_BATCH: "20"
+
+      # If a full cycle makes no progress for this long, the bot saves state and
+      # exits non-zero so restart:unless-stopped can restart it. A healthcheck
+      # cannot do this - Docker marks a container unhealthy without restarting
+      # it. "0" disables the watchdog.
+      WATCHDOG_SECONDS: "1800"
+
       # Abuse safety. Repeatedly retrying a rejected login looks like
       # credential stuffing and can get a mailbox suspended, so the bot stops
       # instead. The send caps should sit below your provider's own limit.
