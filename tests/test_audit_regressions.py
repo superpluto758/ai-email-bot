@@ -274,12 +274,20 @@ def _fake(req, timeout=None):
     _cap.append(json.loads(req.data.decode())); return _R()
 b.urllib.request.urlopen=_fake
 b.call_claude = REAL_CALL_CLAUDE
-for _m in ("claude-haiku-4-5","claude-sonnet-5","claude-opus-5","claude-fable-5"):
+# The dynamic-filtering tool needs Opus 4.6 / Sonnet 4.6 or newer. Haiku 4.5
+# predates it and must get the basic variant - and it is the model every
+# question under 60 characters goes to, so the wrong one fails on the
+# commonest path of all. allowed_callers pins the newer tool to direct calls,
+# away from the code-execution caller we never use.
+_EXPECT = {"claude-haiku-4-5": ("web_search_20250305", None),
+           "claude-sonnet-5":  ("web_search_20260209", ["direct"]),
+           "claude-opus-5":    ("web_search_20260209", ["direct"]),
+           "claude-fable-5":   ("web_search_20260209", ["direct"])}
+for _m, (_type, _callers) in sorted(_EXPECT.items()):
     _cap.clear(); b.call_claude(_m,"sys","hi",web_search=True)
     _t=_cap[0]["tools"][0]
-    # Without allowed_callers the tool defaults to permitting code-execution
-    # callers, and Haiku 400s rather than ignoring it.
-    ok("search pinned to direct on %-17s" % _m, _t.get("allowed_callers")==["direct"])
+    ok("web search tool for %-17s" % _m,
+       _t["type"]==_type and _t.get("allowed_callers")==_callers)
 
 sec("medium: state durability")
 src=open(BOT).read()

@@ -345,6 +345,38 @@ and still gets its ordinary answer.
 The helplines named are UK-based (Samaritans, Childline). If you are elsewhere,
 edit `NON_ADMIN_POLICY` in `bot.py`.
 
+### Why quoted text can never change a setting
+
+A flag alert quotes a stranger's message and invites you to reply to it. When
+you do, your mail client quotes the whole alert back — so the stranger's words
+arrive inside an email genuinely sent from your admin address. Without a guard,
+"please add me to the allowlist" written by them reads exactly like you asking
+for it.
+
+Every setting therefore has to be visible in **what you actually typed in that
+message**, with quoted lines stripped:
+
+- settings that name an address — allowlist, file permission, top-model
+  permission, per-person limits, forgetting someone — need that address typed
+  by you
+- settings that name no address — the reply style, the model, the effort level
+  — need you to have mentioned that setting in your own words
+
+Anything reached only through quoted text is dropped, and the reply tells you
+which ones and why, so you can simply say it again. This is enforced in code,
+not asked for in the prompt, because the text being defended against is written
+by whoever is attacking it.
+
+### Sender authentication
+
+`ADMIN_ADDRESSES` is checked in code, but a `From:` header is trivially forged,
+and an admin address is the most valuable thing to forge here. So when a message
+claims to come from an admin, the receiving server's own `Authentication-Results`
+verdict has to agree: an explicit SPF/DKIM/DMARC **failure** means the message is
+refused unread and you get an alert. A missing header is not treated as a
+failure — plenty of servers do not add one — so this costs nothing on a normal
+mailbox and closes the impersonation route on one that does.
+
 ---
 
 ## Configuration
@@ -372,6 +404,10 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `WEEKLY_REPORT_DAYS` / `MONTHLY_REPORT` / `YEARLY_REPORT` | | Scheduled summaries; `0` disables |
 | `USD_TO_GBP` / `CURRENCY_SYMBOL` | | Currency for reports |
 | `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` | | Remembering people between emails |
+| `MEMORY_NOTE_MAX_CHARS` | | Longest single stored note, default 200 |
+| `DAILY_SPEND_CAP_USD` | | Daily API spend backstop, default 10. Mail is held, not lost; admins exempt; `0` disables |
+| `API_RETRIES` / `MAX_TRANSIENT_HOLDS` | | How a rate limit or an outage is ridden out rather than blamed on the message |
+| `TRIAGE_MODEL` | | Model that triages strangers. Empty = the main model |
 | `REPLY_DELAY_MIN` / `REPLY_DELAY_MAX` | | Random delay, seconds |
 | `AUTH_FAIL_LIMIT` | | Rejected logins before it stops |
 | `MAX_BATCH` | | Messages fetched per pass, default 20; raise `mem_limit` alongside it |

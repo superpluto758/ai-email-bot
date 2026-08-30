@@ -33,6 +33,19 @@ def admin(payload, text=None):
             addrs += [str(a) for a in (payload.get(k) or [])]
         addrs += [str(a) for a in (payload.get("set_limits") or {})]
         text = "please do this for " + ", ".join(addrs) if addrs else "a question"
+        # style/model/effort carry no address, so only_typed cannot defend
+        # them. They now need a matching word in what the admin typed, or a
+        # stranger quoted back in an alert could set them. Say it here, as a
+        # real admin would.
+        said = []
+        if payload.get("style"):
+            said.append("change the reply style")
+        if payload.get("model"):
+            said.append("switch the model")
+        if payload.get("effort"):
+            said.append("set the effort level")
+        if said:
+            text = text + " - " + "; ".join(said)
     return b.handle_admin(st, text, sender=ADMIN, own_text=text) or ""
 
 # ------------------------------------------------------------ admin commands

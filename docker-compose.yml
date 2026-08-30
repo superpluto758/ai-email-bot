@@ -120,6 +120,24 @@ services:
       # and they are stored alongside the allowlist in the state file.
       MEMORY_ENABLED: "1"             # "0" remembers nothing
       MEMORY_MAX_CHARS: "1200"
+      # Longest single note the model may store about one person. Notes go in
+      # the user turn, not the system prompt, so they can never act as a
+      # standing instruction - this just stops one growing into an essay.
+      MEMORY_NOTE_MAX_CHARS: "200"
+
+      # Backstop on a day's API spend, in USD. Once it trips, allowlisted mail
+      # is HELD (answered when the day rolls over, never lost) and strangers are
+      # flagged without costing a call. Admins are never held by it. 0 disables.
+      DAILY_SPEND_CAP_USD: "10"
+      # A 429 or a 5xx is the API having a moment, not a bad message: it is
+      # retried, then the message is held for a later pass rather than being
+      # blamed and abandoned.
+      API_RETRIES: "2"
+      MAX_TRANSIENT_HOLDS: "8"
+      # Model that triages strangers. Empty means "the main model", which is the
+      # safe default - judging a real person to be a machine is the one mistake
+      # this must not make. claude-sonnet-5 is much cheaper if you want it.
+      TRIAGE_MODEL: ""
 
     # Give the SIGTERM handler time to save before Docker resorts to SIGKILL.
     stop_grace_period: 30s
