@@ -83,8 +83,8 @@ services:
       MAX_SENDS_PER_DAY: "80"
 
       # Random delay before replying, so traffic is not machine-timed.
-      REPLY_DELAY_MIN: "4"
-      REPLY_DELAY_MAX: "20"
+      REPLY_DELAY_MIN: "5"
+      REPLY_DELAY_MAX: "25"
 
       # ---- limits, reports and analytics ----------------------------------
       # Replies per person per day for everyone who is not an owner. Admins
