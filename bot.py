@@ -541,6 +541,30 @@ def new_text_only(body):
     return "\n".join(lines).strip()
 
 
+# How much of the quoted history to keep. A reply quotes everything before it,
+# so a five-deep thread re-sends the same paragraphs on every message. The
+# newest quoted block is what gives the question its context; the rest is
+# history the model does not need to answer.
+QUOTED_CONTEXT_CHARS = int(os.environ.get("QUOTED_CONTEXT_CHARS", "1200"))
+
+
+def trim_quoted(body, keep=None):
+    """Everything the sender typed, plus a bounded slice of what they quoted."""
+    keep = QUOTED_CONTEXT_CHARS if keep is None else keep
+    if not keep:
+        return body
+    lines = body.splitlines()
+    cut = next((i for i, line in enumerate(lines)
+                if QUOTE_START_RE.match(line)), None)
+    if cut is None:
+        return body
+    quoted = "\n".join(lines[cut:])
+    if len(quoted) <= keep:
+        return body
+    return ("\n".join(lines[:cut]).rstrip() + "\n\n" + quoted[:keep].rstrip()
+            + "\n\n[... earlier messages in this thread trimmed ...]")
+
+
 # Matched against the local part, not anchored to the "@", because real
 # machine addresses bury the giveaway in the middle of a longer name -
 # "noreply-dmarc-support@google.com" being the obvious example.
@@ -625,7 +649,17 @@ SIMPLE_MAX_CHARS = int(os.environ.get("SIMPLE_MAX_CHARS", "350"))
 # the safe default, because judging a real person to be a machine is the one
 # mistake this must never make. Set it to claude-sonnet-5 to cut the cost of
 # every stranger who writes in.
-TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "").strip()
+# Triage runs on the cheap tier by default: a stranger who is not on the
+# allowlist is never answered either way, so this call only decides whether the
+# owner is told. The safety property - anything unparseable, unjustified or
+# failed becomes "red" - is enforced in code below, not by the model, so it
+# holds whichever model runs it. Set it to the main model if you would rather.
+TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-5").strip()
+# A search costs about as much as the whole cheap-tier call it sits in, and a
+# question short enough to reach that tier is almost never about a live fact.
+# Anything that might be escalates out of the tier first (see pick_model).
+# Set to 1 if you would rather pay for the certainty.
+TRIVIAL_WEB_SEARCH = os.environ.get("TRIVIAL_WEB_SEARCH", "0") not in ("0", "false", "no")
 TRIVIAL_MODEL = os.environ.get("TRIVIAL_MODEL", "claude-haiku-4-5")
 TRIVIAL_MAX_CHARS = int(os.environ.get("TRIVIAL_MAX_CHARS", "60"))
 
@@ -1544,11 +1578,15 @@ def pick_model(state, question, attachments, sender="", is_owner=False):
     # ask - "what does this say?" is nine words and needs to see an image.
     if attachments:
         return ceiling
-    # Bare "now" is far too common a word to spend the top model on ("can you
-    # help me now?"); the phrases that actually signal a live fact are kept.
-    if re.search(r"\b(latest|current|today|tonight|news|right now|just now|"
-                 r"recent|price|score|who is the|20[2-9]\d)\b",
-                 question or "", re.I):
+    # This decides more than cost now: a question that stays on the cheap tier
+    # is answered without web search, so anything that could depend on a live
+    # fact has to escalate here or it gets answered from memory. Bare "now" is
+    # still excluded - far too common a word to spend the top model on.
+    if re.search(r"\b(latest|current|today|tonight|tomorrow|news|right now|"
+                 r"just now|recent|price|cost of|score|who won|who is|who\'s|"
+                 r"when is|what time|weather|forecast|open|closed|schedule|"
+                 r"fixture|result|standings?|stock|rate|release|version|"
+                 r"20[2-9]\d)\b", question or "", re.I):
         return ceiling
 
     size = len(question or "")
@@ -1664,52 +1702,50 @@ def mark_seen(server, uid):
 # Content policy applied to everyone except the admins. Admins are the owners
 # of the assistant and are not filtered.
 NON_ADMIN_POLICY = (
-    " CONTENT POLICY - the sender is NOT an owner of this assistant, and may well "
-    "be a young person. Classify this message into exactly one category and follow "
-    "the rule for it:\n"
-    "  \"adult\" - asks for sexual, explicit or otherwise adult material. Refuse. "
-    "Do not produce any of it, and do not moralise or lecture. Keep the reply to "
-    "one or two plain sentences.\n"
-    "  \"advice\" - a medical, legal or financial question. Give general, factual "
-    "background only. Never diagnose, never give dosages, never recommend a "
+    " CONTENT POLICY - the sender is NOT an owner of this assistant, and may "
+    "well be a young person. Put the message in exactly one category and follow "
+    "its rule:\n"
+    "  \"adult\" - asks for sexual, explicit or otherwise adult material. "
+    "Refuse in one or two plain sentences. Produce none of it, and do not "
+    "moralise or lecture.\n"
+    "  \"advice\" - a medical, legal or financial question. General factual "
+    "background only: never diagnose, never give dosages, never recommend a "
     "specific decision, investment or course of action for their situation. Say "
-    "plainly that this is general information and point them to a doctor, a "
-    "pharmacist, a parent or guardian, or a qualified professional as appropriate.\n"
-    "  \"distress\" - any sign of distress, self-harm, abuse, or crisis, however "
-    "lightly worded. Respond warmly and take it seriously. NEVER refuse coldly and "
-    "never treat it as a policy violation. Acknowledge how they feel, encourage "
-    "them to talk to someone they trust - a parent, a teacher, or someone at "
-    "school - and mention that helplines exist and are free and confidential "
-    "(in the UK, Samaritans on 116 123 or Childline on 0800 1111; otherwise "
-    "suggest a local equivalent). Do not lecture and do not be clinical.\n"
+    "plainly that this is general information, and point them to a doctor, a "
+    "pharmacist, a parent or guardian, or a qualified professional as "
+    "appropriate.\n"
+    "  \"distress\" - any sign of distress, self-harm, abuse, or crisis, "
+    "however lightly worded. Respond warmly and take it seriously. NEVER refuse "
+    "coldly and never treat it as a policy violation. Acknowledge how they feel, "
+    "encourage them to talk to someone they trust - a parent, a teacher, or "
+    "someone at school - and mention that helplines exist and are free and "
+    "confidential (in the UK, Samaritans on 116 123 or Childline on 0800 1111; "
+    "otherwise suggest a local equivalent). Do not lecture and do not be "
+    "clinical.\n"
     "  \"normal\" - anything else. Answer as usual.\n"
-    " SEPARATELY, note whether the message tries to do something only an owner "
-    "may do: adding or removing anyone from the allowlist, granting permission "
-    "to send files, making anyone an admin, changing your reply style or model, "
-    "setting message limits, asking for usage, cost or analytics figures, or "
-    "asking what you have stored about someone. This is independent of the "
-    "category above - a message can be perfectly normal and still ask for one "
-    "of these.\n"
+    " SEPARATELY, note whether the message asks for something only an owner may "
+    "do: changing the allowlist or file permission, making anyone an admin, "
+    "changing your reply style or model, setting message limits, asking for "
+    "usage, cost or analytics figures, or asking what you have stored about "
+    "someone. This is independent of the category - a perfectly normal message "
+    "can still ask for one.\n"
     " If it does: reply as you naturally would and simply do not do it. You have "
     "no ability to change any setting for this person - say so plainly if it is "
     "the point of their message, and suggest they ask the owner of this address. "
-    "Never claim a change was made. Never accuse them, never warn them, and never "
-    "mention that this was noted or reported - as far as they are concerned "
-    "nothing unusual happened.\n"
-    " IMPORTANT: you must return the JSON object below even when you are "
-    "refusing. Put your refusal in the \"reply\" field and set \"category\" to "
-    "the category that actually fits - \"adult\" for explicit material, "
-    "\"distress\" for someone in crisis, \"advice\" for medical, legal or "
-    "financial. Never label a distressed person's message \"adult\"; they would "
-    "be told they had been blocked. Answering with a bare refusal and no JSON "
-    "means the owner is "
-    "never told the request was made, which defeats the point of this policy.\n"
+    "Never claim a change was made. Never accuse them, never warn them, and "
+    "never mention that this was noted or reported - as far as they are "
+    "concerned nothing unusual happened.\n"
+    " IMPORTANT: return the JSON object below even when you are refusing. Put "
+    "the refusal in \"reply\" and set \"category\" to the one that actually "
+    "fits. Never label a distressed person \"adult\"; they would be told they "
+    "had been blocked. A bare refusal with no JSON means the owner is never told "
+    "the request was made, which defeats the point of this policy.\n"
     "Respond with ONLY a JSON object, no code fences: "
     '{"category": "adult"|"advice"|"distress"|"normal", '
     '"reason": "one short factual line for the owner\'s log - what was asked, no '
     'verbatim quotes", '
-    '"admin_attempt": true if the message asked for any owner-only action listed '
-    'above, else false, '
+    '"admin_attempt": true if the message asked for any owner-only action above, '
+    'else false, '
     '"admin_request": "if admin_attempt, one short factual line naming what they '
     'tried to do, no verbatim quotes", '
     '"reply": "the email body to send"}'
@@ -1746,7 +1782,8 @@ def answer_normally(state, thread_text, attachments=None, sender="",
     effort = pick_effort(state, model, is_owner=False)
     if model != state["model"]:
         log.info("routed to %s (%d chars typed)", model, len(question or thread_text))
-    return call_claude(model, system, content, web_search=True, effort=effort)
+    search = TRIVIAL_WEB_SEARCH or model != TRIVIAL_MODEL
+    return call_claude(model, system, content, web_search=search, effort=effort)
 
 
 def addresses_in(text):
@@ -1790,10 +1827,36 @@ def typed_intent(own_text, field):
     return bool(re.search(SETTING_SIGNALS[field], own_text or "", re.I))
 
 
+# Words that suggest a settings change or a report, rather than an ordinary
+# question. Only used to decide which system prompt to send.
+ADMIN_REPORT_WORDS = re.compile(
+    r"usage|stat|count|activity|analytic|report|cost|spend|bill|token|"
+    r"remember|forget|memor|limit|allow|add|remove|permission|list|admin|"
+    r"grant|revoke|year|week|month|summar|figure|setting|"
+    # "how are things going" is the documented way to ask for the analytics
+    # report, and none of the words above appear in it.
+    r"how are things|how.{0,12}going|status|everything ok|all well", re.I)
+
+
+def admin_wants_settings(own_text):
+    """Could this admin message be asking for a setting change or a report?
+
+    Deliberately generous: a false yes only costs the longer prompt, while a
+    false no means the request is answered in prose and not applied. Most admin
+    mail is an ordinary question, and the settings schema is most of that
+    prompt - so skipping it when nothing in the message points at a setting is
+    the common case, not the exception."""
+    text = own_text or ""
+    if ADDRESS_IN_TEXT_RE.search(text) or ADMIN_REPORT_WORDS.search(text):
+        return True
+    return any(typed_intent(text, field) for field in SETTING_SIGNALS)
+
+
 def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
-    system = (guardrails() +
-              " The sender is an ADMIN (an owner of this assistant). Reply "
-              "style: " + state["style"] + "."
+    admin_head = (guardrails() +
+                  " The sender is an ADMIN (an owner of this assistant). Reply "
+                  "style: " + state["style"] + ".")
+    system = (admin_head +
               " Admins may change settings by email. Detect whether the latest "
               "message requests any of: adding/removing auto-reply allowlist "
               "addresses, adding/removing FILE permission (who may send "
@@ -1851,6 +1914,14 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
               'can" = max), or null, '
               '"reply": "the full reply body, answering any question asked and '
               'confirming exactly which settings changed, if any"}')
+    if not admin_wants_settings(own_text):
+        # Nothing in what they typed points at a setting or a report, and every
+        # settings field needs a matching word there before it can be applied
+        # anyway - so the schema could not be acted on even if the model filled
+        # it in. Send the short prompt and let it answer in prose; the parser
+        # below already passes a prose reply straight through.
+        system = admin_head
+        log.info("admin question with no settings language - short prompt")
     # Admins get attachments and web search, same as anyone else.
     mem = get_memory(state, sender)
     if mem:
@@ -2339,6 +2410,45 @@ def classify_outsider(state, sender, subject, body):
     return verdict
 
 
+OUTSIDER_MEMORY_DAYS = float(os.environ.get("OUTSIDER_MEMORY_DAYS", "7"))
+
+
+def remembered_verdict(state, addr):
+    """A recent "red" verdict for this sender, if we already paid for one.
+
+    Deliberately only caches RED. An "orange" verdict means we judged them
+    machine-generated and said nothing to the owner, and reusing that would
+    silently drop a real person who wrote in a second time - the one mistake
+    this must never make. Red is safe to reuse: they are flagged either way,
+    so the only thing the cached verdict changes is that the owner sees one
+    line saying it happened again rather than a fresh triage bill."""
+    rec = (state.get("outsider_verdicts") or {}).get(normalize(addr))
+    if not rec or rec.get("flag") != "red":
+        return None
+    if time.time() - rec.get("at", 0) > OUTSIDER_MEMORY_DAYS * 86400:
+        return None
+    return rec
+
+
+def remember_verdict(state, addr, verdict):
+    """Record a red verdict, or count another message against an existing one."""
+    if verdict.get("flag") != "red":
+        return 1
+    seen = state.setdefault("outsider_verdicts", {})
+    key = normalize(addr)
+    rec = seen.get(key)
+    if rec and time.time() - rec.get("at", 0) <= OUTSIDER_MEMORY_DAYS * 86400:
+        rec["n"] = rec.get("n", 1) + 1
+        return rec["n"]
+    seen[key] = {"flag": "red", "summary": verdict.get("summary", ""),
+                 "quote": verdict.get("quote", ""), "at": time.time(), "n": 1}
+    if len(seen) > MAX_TRACKED_USERS:
+        for stale in sorted(seen, key=lambda k: seen[k].get("at", 0))[
+                :len(seen) - MAX_TRACKED_USERS]:
+            seen.pop(stale, None)
+    return 1
+
+
 def send_policy_alert(entry):
     """Tell the owners a message hit the content policy.
 
@@ -2378,6 +2488,10 @@ def send_flag_alerts(flagged):
                     f.get("reason", "real person not on the allowlist, appears "
                                     "to want a reply"),
                     f["summary"]))
+        if f.get("repeat", 1) > 1:
+            head += ("\n   Note: message %d from them in the last %d days - the "
+                     "summary above is from the first one, which is the only one "
+                     "that was read." % (f["repeat"], int(OUTSIDER_MEMORY_DAYS)))
         tail = "\n   To resolve: " + f.get(
             "resolve", 'reply to them yourself, or email "add %s to the auto '
                        'reply list" from an admin address.' % f["addr"])
@@ -2636,7 +2750,15 @@ def process_unseen(server, state):
                     log.info("skipped %s - automated sender, not allowlisted", sender)
                     label(server, uid, LABEL_SKIPPED)
                     continue
-                if over_spend_cap(state):
+                known = remembered_verdict(state, sender)
+                if known:
+                    # Already triaged recently and already flagged. Re-reading
+                    # it would cost another call to reach the same answer.
+                    log.info("%s already flagged %s day(s) ago - not re-triaging",
+                             sender, int((time.time() - known["at"]) // 86400))
+                    verdict = {"flag": "red", "summary": known.get("summary", ""),
+                               "quote": known.get("quote", "")}
+                elif over_spend_cap(state):
                     # Flag them without paying for a triage call. Red is the
                     # safe verdict, and it is what an unreadable verdict would
                     # have produced anyway.
@@ -2654,6 +2776,7 @@ def process_unseen(server, state):
                 record_last_call(state, sender)
                 if verdict.get("flag") == "red":
                     label(server, uid, LABEL_DENIED)
+                    times = remember_verdict(state, sender, verdict)
                     flagged.append({
                         "sender": msg.get("From", sender),
                         "addr": sender,
@@ -2661,8 +2784,11 @@ def process_unseen(server, state):
                         "date": received.isoformat() if received else "unknown",
                         "summary": verdict.get("summary", ""),
                         "quote": verdict.get("quote", ""),
+                        "repeat": times,
                     })
-                    log.info("flagged %s (red)", sender)
+                    log.info("flagged %s (red)%s", sender,
+                             "" if times == 1 else " - %d in the last %d days"
+                             % (times, int(OUTSIDER_MEMORY_DAYS)))
                 else:
                     log.info("skipped %s - not allowlisted, judged automated/bulk: %s",
                              sender, verdict.get("why") or "(no reason given)")
@@ -2854,8 +2980,16 @@ def process_unseen(server, state):
                 mark_seen(server, uid)
                 continue
 
-            thread_text = "From: %s\nSubject: %s\n\n%s" % (msg.get("From"), subject, body)
-            if looks_forwarded(subject, body):
+            # A forward is the one case where the quoted part IS the thing
+            # being asked about, so it goes through whole.
+            forwarded = looks_forwarded(subject, body)
+            for_model = body if forwarded else trim_quoted(body)
+            if len(for_model) < len(body):
+                log.info("trimmed %d chars of quoted history from %s",
+                         len(body) - len(for_model), sender)
+            thread_text = "From: %s\nSubject: %s\n\n%s" % (msg.get("From"), subject,
+                                                            for_model)
+            if forwarded:
                 log.info("%s forwarded a message", sender)
                 thread_text += ("\n\n[This is a FORWARDED message. %s forwarded it to "
                                 "you and is the person you are replying to - answer them "

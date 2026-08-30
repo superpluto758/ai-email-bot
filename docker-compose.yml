@@ -134,10 +134,23 @@ services:
       # blamed and abandoned.
       API_RETRIES: "2"
       MAX_TRANSIENT_HOLDS: "8"
-      # Model that triages strangers. Empty means "the main model", which is the
-      # safe default - judging a real person to be a machine is the one mistake
-      # this must not make. claude-sonnet-5 is much cheaper if you want it.
-      TRIAGE_MODEL: ""
+      # Model that triages strangers. It only decides whether YOU are told - a
+      # stranger is never answered either way - and the fail-safe (anything
+      # unjustified, unparseable or failed becomes "red") is enforced in code,
+      # so the cheap tier is safe here. Set to claude-opus-5 to spend more.
+      TRIAGE_MODEL: "claude-sonnet-5"
+      # How long a "red" verdict is remembered, so the same stranger writing
+      # repeatedly costs one triage call rather than one per email. Only red is
+      # ever cached; "machine-generated" is always re-checked, so a real person
+      # who writes a second time can never be silently dropped.
+      OUTSIDER_MEMORY_DAYS: "7"
+      # A search costs about as much as a whole cheap-tier call, and a question
+      # short enough to reach that tier is almost never about a live fact.
+      # Anything that might be escalates a tier first. Set to 1 to buy it anyway.
+      TRIVIAL_WEB_SEARCH: "0"
+      # How much of a quoted thread to send. What the sender typed is always
+      # sent in full; this bounds the history quoted underneath it. 0 disables.
+      QUOTED_CONTEXT_CHARS: "1200"
 
     # Give the SIGTERM handler time to save before Docker resorts to SIGKILL.
     stop_grace_period: 30s

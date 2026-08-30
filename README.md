@@ -407,7 +407,10 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `MEMORY_NOTE_MAX_CHARS` | | Longest single stored note, default 200 |
 | `DAILY_SPEND_CAP_USD` | | Daily API spend backstop, default 10. Mail is held, not lost; admins exempt; `0` disables |
 | `API_RETRIES` / `MAX_TRANSIENT_HOLDS` | | How a rate limit or an outage is ridden out rather than blamed on the message |
-| `TRIAGE_MODEL` | | Model that triages strangers. Empty = the main model |
+| `TRIAGE_MODEL` | | Model that triages strangers, default `claude-sonnet-5`. Empty = the main model |
+| `OUTSIDER_MEMORY_DAYS` | | How long a stranger's flag is remembered, default 7. Only "red" is cached |
+| `TRIVIAL_WEB_SEARCH` | | Buy web search on the cheapest tier too. Off by default |
+| `QUOTED_CONTEXT_CHARS` | | How much quoted thread history to send, default 1200; `0` sends it all |
 | `REPLY_DELAY_MIN` / `REPLY_DELAY_MAX` | | Random delay, seconds |
 | `AUTH_FAIL_LIMIT` | | Rejected logins before it stops |
 | `MAX_BATCH` | | Messages fetched per pass, default 20; raise `mem_limit` alongside it |
@@ -516,6 +519,28 @@ bill does. Currency conversion uses a fixed rate you set; Anthropic bills in
 USD, so their console is authoritative.
 
 ---
+
+### Where the money actually goes
+
+Web search, not tokens. A search costs $0.01; a whole Haiku call with the full
+system prompt costs about $0.003. Two searches cost more than an Opus answer.
+
+So the assistant buys search where it plausibly matters and not otherwise:
+
+- the cheapest tier (questions under `TRIVIAL_MAX_CHARS`) gets **no** search,
+  because anything that might depend on a live fact escalates a tier first —
+  `who won`, `weather`, `price`, `latest`, a year, and so on all escalate
+- strangers are triaged on `TRIAGE_MODEL` rather than the main model, and a
+  "red" verdict is remembered for `OUTSIDER_MEMORY_DAYS`, so someone writing
+  five times costs one triage call and appears once in your digest
+- an admin email with no settings or report language in it is sent a short
+  prompt without the settings schema — roughly a third of the size
+- a reply sends what the sender typed in full, plus `QUOTED_CONTEXT_CHARS` of
+  the thread quoted underneath it, rather than the whole history every time
+
+Trimming the prompts themselves is not worth it: every fixed token the
+assistant re-sends in a day costs about a penny. Check your own numbers before
+changing any of this — email the bot `spend` and read the searches column.
 
 ## Tests
 
