@@ -64,8 +64,42 @@ r = admin({"add":["not-an-email"],"reply":"ok"})
 ok("malformed address ignored", not b.in_list("not-an-email", st["allowlist"]))
 r = admin({"file_add":["f@example.com"],"reply":"ok"})
 ok("file permission granted", b.in_list("f@example.com", st["file_allowlist"]))
+# Adding someone to the file list ONLY would have been an inert grant: an
+# address off the main allowlist is never answered, so it could attach whatever
+# it liked and get silence. "Let them send files" means "and read their mail".
+ok("file permission also grants the main allowlist",
+   b.in_list("f@example.com", st["allowlist"]))
+ok("the new person is dated, like any other add",
+   b.normalize("f@example.com") in st["added_at"])
+ok("both grants are reported, not just one",
+   "added f@example.com" in r and "may now send files: f@example.com" in r, r[-160:])
+
 r = admin({"file_remove":["f@example.com"],"reply":"ok"})
 ok("file permission revoked", not b.in_list("f@example.com", st["file_allowlist"]))
+# Deliberately NOT the mirror image: taking attachments away must not silently
+# stop answering someone the admin still talks to.
+ok("revoking files leaves them on the main allowlist",
+   b.in_list("f@example.com", st["allowlist"]))
+
+# Someone already allowlisted gains only the file permission, once.
+r = admin({"add":["g@example.com"],"reply":"ok"})
+r = admin({"file_add":["g@example.com"],"reply":"ok"})
+ok("no duplicate add for an existing member", "added g@example.com" not in r, r[-160:])
+ok("still on the allowlist exactly once",
+   [b.normalize(a) for a in st["allowlist"]].count(b.normalize("g@example.com")) == 1)
+r = admin({"file_add":["g@example.com"],"reply":"ok"})
+ok("file_add is idempotent",
+   [b.normalize(a) for a in st["file_allowlist"]].count(b.normalize("g@example.com")) == 1)
+
+r = admin({"file_add":[b.SELF],"reply":"ok"})
+ok("file_add cannot allowlist the bot itself (mail loop)",
+   not b.in_list(b.SELF, st["allowlist"]))
+ok("and does not get file permission either",
+   not b.in_list(b.SELF, st["file_allowlist"]))
+r = admin({"file_add":["not-an-email"],"reply":"ok"})
+ok("malformed address grants nothing",
+   not b.in_list("not-an-email", st["allowlist"])
+   and not b.in_list("not-an-email", st["file_allowlist"]))
 r = admin({"file_remove":[b.ADMINS[1]],"reply":"ok"})
 ok("admin file permission protected", b.in_list(b.ADMINS[1], st["file_allowlist"]))
 r = admin({"opus_add":[USER],"reply":"ok"})

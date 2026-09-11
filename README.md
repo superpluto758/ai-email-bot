@@ -23,7 +23,7 @@ another account on someone else's platform.
 - **Searches the web** for anything time-sensitive instead of trusting training
   data that may be out of date
 - **Two permission tiers** — who may write to it at all, and the smaller set
-  who may send files
+  who may send files. Granting the second grants the first
 - **Admin commands by email** — add and remove people, change tone, switch
   model, request usage stats, all in plain English
 - **Per-user limits** — 30 replies per person per day by default, editable by
@@ -142,6 +142,15 @@ From an admin address, in plain English:
 | Remove someone | `remove alice@example.com from the allowlist` |
 | Let someone send files | `allow alice@example.com to send files` |
 | Revoke file permission | `remove alice@example.com from the file allowlist` |
+
+Granting file permission also adds the person to the main allowlist if they
+are not on it already — one instruction, both tiers. On its own it would be an
+inert grant: an address off the main allowlist is never answered at all, so it
+could attach whatever it liked and get silence back, with the confirmation
+email saying permission had been given. Revoking is deliberately *not* the
+mirror image — it takes attachments away and leaves the person on the main
+allowlist, because "no more files" should not silently stop answering someone
+you still talk to.
 | Change tone | `keep replies shorter and more casual` |
 | Switch model | `use sonnet` / `use opus` / `use haiku` / `use fable` |
 | Analytics | `show me the analytics` / `how's it going?` |
@@ -420,7 +429,7 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `ADMIN_ADDRESSES` | ✓ | Owners, comma separated |
 | `IMAP_HOST` / `SMTP_HOST` / `SMTP_PORT` | | Your provider's servers |
 | `ALLOWLIST` | | Who gets answered. Defaults to the admins |
-| `FILE_ALLOWLIST` | | Who may send attachments. Defaults to the admins |
+| `FILE_ALLOWLIST` | | Who may send attachments. Defaults to the admins. Seed it with people who are on `ALLOWLIST` too — at startup it is not merged, only by-email grants are |
 | `ALERT_ADDRESSES` | | Where alerts and reports go. Defaults to the admins |
 | `NEVER_UNPROMPTED_ADDRESSES` | | Admins who are never emailed unless they wrote first |
 | `IGNORE_SENDERS` | | Senders left completely alone — never read, answered or counted |
@@ -578,21 +587,21 @@ changing any of this — email the bot `spend` and read the searches column.
 python3 tests/run.py
 ```
 
-415 assertions covering parsing, routing, permissions, the content policy,
+427 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
 
 ```
-test_admin_and_policy.py         59 passed, 0 failed
-test_audit_regressions.py        92 passed, 0 failed
+test_admin_and_policy.py         69 passed, 0 failed
+test_audit_regressions.py        94 passed, 0 failed
 test_core.py                     83 passed, 0 failed
 test_efficiency.py               54 passed, 0 failed
 test_hardening.py                53 passed, 0 failed
 test_processing.py               35 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-415 assertions, 0 failures
+427 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

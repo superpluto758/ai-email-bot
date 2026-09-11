@@ -1906,7 +1906,7 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
               "any question; leave the outcome to that appended summary. "
               "Respond with ONLY a JSON object, no code fences: "
               '{"add": [emails], "remove": [emails], '
-              '"file_add": [emails], "file_remove": [emails], '
+              '"file_add": [emails] if they should be allowed to send files or attachments - this also lets them email at all, so use it even if they are not on the main list yet, "file_remove": [emails], '
               '"usage_report": true if they asked how many emails have been sent, '
               'for usage/stats/counts/activity, else false, '
               '"usage_for": [emails] if they asked about specific people only, '
@@ -2015,7 +2015,20 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
     files = state.setdefault("file_allowlist", list(DEFAULT_FILE_ALLOWLIST))
     for addr in parsed.get("file_add") or []:
         addr = str(addr).strip().lower()
-        if not EMAIL_RE.match(addr) or in_list(addr, files):
+        if not EMAIL_RE.match(addr):
+            continue
+        if normalize(addr) == normalize(SELF):
+            continue          # never allowlist ourselves - mail loop
+        # Permission to send files is useless on its own. An address that is
+        # not on the main allowlist is never answered at all, so it could
+        # attach whatever it liked and get silence back - the grant would look
+        # applied and do nothing. "Let them send files" always means "and read
+        # their mail", so it grants both.
+        if not in_list(addr, state["allowlist"]):
+            state["allowlist"].append(addr)
+            state["added_at"][normalize(addr)] = time.time()
+            changes.append("added " + addr)
+        if in_list(addr, files):
             continue
         files.append(addr)
         changes.append("may now send files: " + addr)
@@ -2029,6 +2042,9 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
             a for a in files if normalize(a) != normalize(addr)]
         if len(files) < before:
             changes.append("may no longer send files: " + addr)
+    # Deliberately not the mirror of file_add: taking away attachments means
+    # "keep answering them, just no files". Dropping them from the main
+    # allowlist too would silently cut off someone the admin still talks to.
     if parsed.get("style"):
         state["style"] = str(parsed["style"])
         changes.append("style updated")
