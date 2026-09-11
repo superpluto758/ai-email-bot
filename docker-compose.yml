@@ -55,7 +55,8 @@ services:
       IGNORE_SENDERS: "noreply-dmarc-support@google.com"
 
       # ---- behaviour (optional) -------------------------------------------
-      FROM_NAME: "AI Assistant"       # display name on replies
+      # Sets the From: display name AND the name it introduces itself with
+      FROM_NAME: "AI Assistant"
       # The bot pins itself to UTC in code; this only matches the container
       # shell to it. Changing it will NOT move the bot off UTC.
       TZ: "UTC"

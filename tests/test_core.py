@@ -200,6 +200,38 @@ for want in ("SYSTEM","Recording since","THIS MONTH, PER PERSON","EMAILS RECEIVE
     ok("analytics has %r" % want, want in full)
 ok("analytics filter narrows", "vip" not in b.full_analytics(st, only=[USER]).lower())
 
+section("what it calls itself")
+# One name, two places. Before this the From: display name and the sentence the
+# model introduces itself with were set independently, so renaming the bot left
+# them disagreeing.
+def reload_with(from_name):
+    env = dict(os.environ)
+    if from_name is None: os.environ.pop("FROM_NAME", None)
+    else: os.environ["FROM_NAME"] = from_name
+    try:
+        sp = importlib.util.spec_from_file_location('bot_renamed', BOT)
+        m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+        return m
+    finally:
+        os.environ.clear(); os.environ.update(env)
+
+m = reload_with("Helper Assistant")
+ok("BOT_NAME follows FROM_NAME", m.BOT_NAME == "Helper Assistant", m.BOT_NAME)
+ok("the prompt introduces it by that name",
+   m.guardrails().startswith("You are Helper Assistant,"), m.guardrails()[:50])
+ok("it still says it is an AI assistant", "an AI assistant" in m.guardrails())
+ok("the From: display name matches",
+   b.formataddr((m.FROM_NAME, "x@example.com")).startswith("Helper Assistant <"))
+
+m = reload_with("  Spaced Name  ")
+ok("surrounding whitespace is trimmed", m.BOT_NAME == "Spaced Name", m.BOT_NAME)
+
+m = reload_with("")
+# An empty FROM_NAME means "send with no display name" - it must not leave the
+# prompt saying "You are , an AI assistant".
+ok("an empty name falls back rather than breaking the sentence",
+   m.BOT_NAME and "You are ," not in m.guardrails(), m.guardrails()[:40])
+
 print("\n%d passed, %d failed" % (P, F))
 for f in FAILS: print("   FAILED:", f)
 sys.exit(1 if F else 0)

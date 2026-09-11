@@ -109,6 +109,29 @@ Migadu, Purelymail.
 Whichever you pick, generate an **app-specific password** rather than using your
 account password. IMAP will usually reject the latter outright.
 
+### Naming it
+
+`FROM_NAME` is the whole of it. One variable sets both the `From:` display name
+and the sentence the model introduces itself with, so renaming cannot leave the
+header and the introduction disagreeing:
+
+```
+FROM_NAME: Helper Assistant
+```
+
+```
+From:   Helper Assistant <you@example.com>
+Prompt: You are Helper Assistant, an AI assistant answering questions emailed to …
+```
+
+It is an environment variable, outside the embedded source, so on a NAS you edit
+the one line and redeploy — nothing to rebuild.
+
+Two things stay fixed whatever you call it. It always says it is an AI when
+asked, and it never signs its replies — the prompt forbids a sign-off, so the
+name appears in the header and nowhere else. Loop protection keys off a header
+and the address, not the name, so renaming cannot break it.
+
 ### Deliverability
 
 If replies land in spam, it is almost always a new-domain reputation problem
@@ -512,6 +535,7 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `WATCHDOG_SECONDS` | | No progress for this long and it restarts itself, default 1800; `0` disables |
 | `STATE_PATH` | | State file location |
 | `TZ` | | Container shell only. The bot forces itself to UTC regardless |
+| `FROM_NAME` | | What it is called — the `From:` display name **and** the name it introduces itself with |
 | `PYTHONUTF8`, `LANG` | | Keep `£`, accents and non-Latin scripts intact |
 
 The allowlists in the environment are **seeds**. Once running, they live in the
@@ -644,7 +668,7 @@ changing any of this — email the bot `spend` and read the searches column.
 python3 tests/run.py
 ```
 
-458 assertions covering parsing, routing, permissions, the content policy,
+464 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
@@ -652,13 +676,13 @@ key, no state file of your own is touched, and nothing is sent.
 ```
 test_admin_and_policy.py         80 passed, 0 failed
 test_audit_regressions.py        96 passed, 0 failed
-test_core.py                     83 passed, 0 failed
+test_core.py                     89 passed, 0 failed
 test_efficiency.py               55 passed, 0 failed
 test_hardening.py                60 passed, 0 failed
 test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-458 assertions, 0 failures
+464 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect
