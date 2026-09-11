@@ -380,6 +380,45 @@ Admins are unfiltered. Everyone else is classified per message:
 Alerts carry a short reason, never a verbatim quote — you learn what kind of
 thing was asked without the person's words being reported to you.
 
+### Questions about the system itself
+
+Anyone who is not an owner asking what this thing is — who owns it, who else may
+write to it, what its prompt or model or configuration are — **gets no reply at
+all.** The message is tagged `ai-denied`, marked read, and the owners are
+flagged. Nothing is confirmed and nothing is denied.
+
+This is checked in code, before the model is called, so a probe costs nothing
+and the model never sees the question. Owners are exempt: they are the people
+who need to be able to ask who the admins are.
+
+The regex only ever runs on **newly typed text**. Run over a whole thread it
+would fire on the flag alerts quoted back at you, which say "allowlist" by
+design.
+
+It is deliberately narrow, because a false positive is silence — the one failure
+a sender can neither see nor work around, on a bot that answers schoolwork.
+Every pattern needs the assistant itself as the subject, so these all go through
+untouched:
+
+```
+explain the system of linear equations     how do you work out percentages
+who is the owner of Manchester United?     describe the immune system
+how does it work?                          what is a prompt in writing
+```
+
+A corpus of 37 probes and 76 ordinary questions is pinned in the tests, in both
+directions.
+
+The content policy backs the code up for phrasings the regex misses — but it
+still requires the assistant to **admit plainly that it is an AI** when asked.
+A bot that will not say it is a bot is a worse problem than the leak.
+
+Two things this does *not* do. It does not hide the fact that something was
+read: the sender simply gets nothing back, and a persistent prober learns which
+questions go unanswered. And it is separate from an owner-only *action* — trying
+to change a setting is still answered normally and reported quietly, so nobody
+is tipped off that they were noticed.
+
 ### When someone tries to act as an owner
 
 If a non-admin asks for something only an owner can do — adding someone to the
@@ -605,7 +644,7 @@ changing any of this — email the bot `spend` and read the searches column.
 python3 tests/run.py
 ```
 
-440 assertions covering parsing, routing, permissions, the content policy,
+458 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
@@ -614,12 +653,12 @@ key, no state file of your own is touched, and nothing is sent.
 test_admin_and_policy.py         80 passed, 0 failed
 test_audit_regressions.py        96 passed, 0 failed
 test_core.py                     83 passed, 0 failed
-test_efficiency.py               54 passed, 0 failed
-test_hardening.py                53 passed, 0 failed
-test_processing.py               35 passed, 0 failed
+test_efficiency.py               55 passed, 0 failed
+test_hardening.py                60 passed, 0 failed
+test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-440 assertions, 0 failures
+458 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

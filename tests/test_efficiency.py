@@ -142,7 +142,11 @@ for rule in ("adult", "advice", "distress", "normal",
              "Never label a distressed person",
              "admin_attempt", "no code fences", "one or two plain sentences"):
     ok("policy still says %r" % rule[:34], rule in pol)
-ok("policy got shorter", len(pol) < 3063, len(pol))
+# 3063 was the size before the optimisation pass, which took it to 2794. The
+# system-probe rule then added ~227 back, so the headroom is now thin: this is
+# not an invitation to spend the rest of it, it is a tripwire.
+ok("policy still under the pre-optimisation size", len(pol) < 3063, len(pol))
+ok("policy has not crept past its current size", len(pol) <= 3030, len(pol))
 
 print("\n%d passed, %d failed" % (P, F))
 for f in FAILS: print("   FAILED:", f)
