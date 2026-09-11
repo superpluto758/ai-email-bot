@@ -23,10 +23,30 @@ import urllib.error
 import urllib.request
 from email.header import decode_header
 from email.message import EmailMessage
-from datetime import datetime
-from email.utils import formataddr, formatdate, make_msgid, parseaddr
+from datetime import datetime, timezone
+from email.utils import format_datetime, formataddr, make_msgid, parseaddr
 
 from imapclient import IMAPClient
+
+# Everything this bot dates - log lines, spend buckets, daily quotas, the Date:
+# header, IMAP INTERNALDATE - is UTC, whatever the host clock is set to. The two
+# deployments used to disagree (Asia/Singapore against Europe/London), so "today"
+# for a daily quota depended on which copy you were looking at.
+os.environ["TZ"] = "UTC"
+if hasattr(time, "tzset"):          # Unix only; the container is Linux
+    time.tzset()
+UTC = timezone.utc
+
+
+def now_utc():
+    """The time now, in UTC. Everything dated goes through here."""
+    return datetime.now(UTC)
+
+
+def ts_utc(epoch):
+    """An epoch-seconds value as a UTC datetime."""
+    return datetime.fromtimestamp(epoch, UTC)
+
 
 # ---------------------------------------------------------------- config ---
 
@@ -271,7 +291,7 @@ def save_state(state):
         if kept:
             sent[addr] = kept
     state["sent_to"] = sent
-    cutoff_year = datetime.now().year - 1
+    cutoff_year = now_utc().year - 1
     state["spend_week"] = {k: v for k, v in (state.get("spend_week") or {}).items()
                            if k[:4].isdigit() and int(k[:4]) >= cutoff_year}
     directory = os.path.dirname(STATE_PATH)
@@ -1078,7 +1098,7 @@ def send_mail(to_addrs, subject, body, in_reply_to=None, references=None):
     msg["From"] = formataddr((FROM_NAME, SELF)) if FROM_NAME else SELF
     msg["To"] = ", ".join(to_addrs)
     msg["Subject"] = clean_header(subject)
-    msg["Date"] = formatdate(localtime=True)
+    msg["Date"] = format_datetime(now_utc())
     msg["Message-ID"] = make_msgid()
     # RFC 3834's Auto-Submitted header is read by spam filters as a
     # machine-generated signal. This Microsoft header stops Exchange
@@ -1179,7 +1199,7 @@ def usage_report(state, only=None):
     out += [line, render("TOTAL", [sum(r[i] for r in rows)
                                    for i in range(1, len(USAGE_COLUMNS) + 1)])]
     out += ["", "Emails received per sender. Anything older than 3 months is discarded.",
-            "Generated " + datetime.now().strftime("%Y-%m-%d %H:%M")]
+            "Generated " + now_utc().strftime("%Y-%m-%d %H:%M") + " UTC"]
     if wanted and missing:
         out.append("No emails on record from: " + ", ".join(missing))
     return "\n".join(out)
@@ -1187,7 +1207,7 @@ def usage_report(state, only=None):
 
 def user_tally(state, addr, month=None):
     """The per-person record for a month: messages, tokens, searches, cost."""
-    month = month or datetime.now().strftime("%Y-%m")
+    month = month or now_utc().strftime("%Y-%m")
     return (state.setdefault("by_user", {}).setdefault(month, {})
             .setdefault(normalize(addr),
                         {"msgs_in": 0, "msgs_out": 0, "in": 0, "out": 0,
@@ -1213,7 +1233,7 @@ def record_spend(state, model, usage, searches=0, sender=None):
     """Accumulate token spend by month so the owners can see the bill coming."""
     if not usage:
         return
-    now = datetime.now()
+    now = now_utc()
     month = now.strftime("%Y-%m")
     week = "%s-W%02d" % (now.isocalendar()[0], now.isocalendar()[1])
     bucket = state.setdefault("spend", {}).setdefault(
@@ -1248,7 +1268,7 @@ def record_spend(state, model, usage, searches=0, sender=None):
 
 def spend_today(state):
     return float((state.get("spend_day") or {}).get(
-        datetime.now().strftime("%Y-%m-%d"), {}).get("usd", 0.0))
+        now_utc().strftime("%Y-%m-%d"), {}).get("usd", 0.0))
 
 
 def over_spend_cap(state):
@@ -1262,7 +1282,7 @@ def spend_rollups(state):
     if not months:
         return ""
     keys = sorted(months)
-    now = datetime.now()
+    now = now_utc()
     last3 = keys[-3:]
     this_year = [k for k in keys if k.startswith(now.strftime("%Y"))]
 
@@ -1292,7 +1312,7 @@ def wanted_year(value):
     in which case the model returns true rather than a year - and int("True")
     raises, taking the whole reply down with it."""
     digits = re.sub(r"\D", "", str(value or ""))[:4]
-    return int(digits) if len(digits) == 4 else datetime.now().year
+    return int(digits) if len(digits) == 4 else now_utc().year
 
 
 def yearly_cost_report(state, year=None):
@@ -1317,7 +1337,7 @@ def weekly_cost_report(state, year=None):
     year = wanted_year(year)
     weeks = state.get("spend_week") or {}
     mine = {k: v for k, v in weeks.items() if k.startswith("%d-W" % year)}
-    now = datetime.now()
+    now = now_utc()
     last_week = now.isocalendar()[1] if now.year == year else 52
     if not mine and now.year != year:
         return "No spend recorded for %d." % year
@@ -1368,7 +1388,7 @@ def spend_report(state):
 
 def cost_by_user(state, month=None, only=None):
     """Full per-person breakdown for a month: messages, tokens, searches, cost."""
-    month = month or datetime.now().strftime("%Y-%m")
+    month = month or now_utc().strftime("%Y-%m")
     per_user = (state.get("by_user") or {}).get(month) or {}
     if only:
         wanted = [normalize(a) for a in only]
@@ -1412,13 +1432,13 @@ def full_analytics(state, only=None, month=None):
     Every analytics request returns this same shape - the system block and the
     per-person table - so the answer never depends on how the question was
     phrased. `only` narrows the per-person table to specific addresses."""
-    month = month or datetime.now().strftime("%Y-%m")
+    month = month or now_utc().strftime("%Y-%m")
     spend = (state.get("spend") or {}).get(month, {})
     now = time.time()
     since = state.get("recording_since") or state.get("started_at")
     if since:
         recording = "%s  (%s across %d start%s)" % (
-            datetime.fromtimestamp(since).strftime("%Y-%m-%d"),
+            ts_utc(since).strftime("%Y-%m-%d"),
             human_duration(now - since), state.get("starts", 1),
             "" if state.get("starts", 1) == 1 else "s")
     else:
@@ -1435,6 +1455,7 @@ def full_analytics(state, only=None, month=None):
         "  Model:            %s   (simple questions -> %s)"
         % (state.get("model"), SIMPLE_MODEL or "same"),
         "  Recording since:  %s" % recording,
+        "  Clock:            UTC   (dates and daily limits roll over at 00:00 UTC)",
         "  This run:         %s" % uptime,
         "  People allowed:   %d   (may send files: %d)"
         % (len(state.get("allowlist", [])), len(state.get("file_allowlist", []))),
@@ -2526,7 +2547,7 @@ def maybe_reports(state):
         return
     now = time.time()
     dirty = False
-    this_month = datetime.now().strftime("%Y-%m")
+    this_month = now_utc().strftime("%Y-%m")
 
     # --- monthly, on the first run after the month rolls over ---------------
     last_month_sent = state.get("last_monthly_month")
@@ -2555,7 +2576,7 @@ def maybe_reports(state):
             dirty = True
 
     # --- yearly, cost only, on the first run after the year turns over ------
-    this_year = datetime.now().strftime("%Y")
+    this_year = now_utc().strftime("%Y")
     last_year_sent = state.get("last_yearly_year")
     if YEARLY_REPORT:
         if not last_year_sent:
@@ -2832,7 +2853,7 @@ def process_unseen(server, state):
                 limit, used = hit
                 log.info("%s has had %d/%d replies today - declining", sender, used, limit)
                 already = state.setdefault("limit_notified", {})
-                day = datetime.now().strftime("%Y-%m-%d")
+                day = now_utc().strftime("%Y-%m-%d")
                 if already.get(normalize(sender)) != day:
                     # Once per person per day, so a chatty sender cannot spam you.
                     # Stamped only after the send succeeds - stamping first meant
@@ -2905,7 +2926,7 @@ def process_unseen(server, state):
             if not is_admin(sender) and over_spend_cap(state):
                 log.warning("holding %s - today's API spend has reached the "
                             "$%.2f cap", sender, DAILY_SPEND_CAP_USD)
-                day = datetime.now().strftime("%Y-%m-%d")
+                day = now_utc().strftime("%Y-%m-%d")
                 capped = state.setdefault("spend_cap_notified", {})
                 if capped.get("day") != day:
                     try:
@@ -3330,7 +3351,7 @@ def main():
     log.info("AI email answerer starting - mailbox=%s via %s | model=%s | "
              "allowlist=%d | recording since %s (start #%d)",
              SELF, IMAP_HOST, state["model"], len(state["allowlist"]),
-             datetime.fromtimestamp(state["recording_since"]).strftime("%Y-%m-%d"),
+             ts_utc(state["recording_since"]).strftime("%Y-%m-%d"),
              state["starts"])
 
     backoff = 5

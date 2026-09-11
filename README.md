@@ -171,6 +171,7 @@ SYSTEM
   Mailbox:          you@example.com
   Model:            claude-opus-5   (simple questions -> claude-sonnet-5)
   Recording since:  2026-08-12  (16.4 days across 7 starts)
+  Clock:            UTC   (dates and daily limits roll over at 00:00 UTC)
   This run:         4.2 days   (stopped for 3.1 hours in total)
   People allowed:   5   (may send files: 4)
   Default limit:    30 msg/day
@@ -197,6 +198,27 @@ asks for them — they would otherwise bury the monthly figures that matter.
 
 Tables are sent as both plain text and HTML, so columns stay aligned in clients
 that would otherwise reflow them.
+
+### The clock is UTC
+
+Every date the bot produces is UTC: the spend buckets, the weekly and monthly
+reports, the `Date:` header on replies, the log timestamps, and the moment a
+per-person daily limit resets.
+
+This is pinned in code, not inherited from the host. Nothing dates itself by
+calling the local clock — a single `now_utc()` is the only way to ask the time,
+and the tests fail if a `datetime.now()` reappears anywhere in the file. Setting
+`TZ` in the compose file will not move it; the bot overwrites `TZ` at startup so
+that even the container's own shell and the IMAP `INTERNALDATE` agree with it.
+
+That is deliberate. "Used today: 7" has to mean one thing. When the clock came
+from the host, two copies of this bot with different `TZ` values gave different
+answers from the same state file, and a daily limit could reset twice or not at
+all on the day a machine moved. UTC is the only reading that does not depend on
+where the box happens to be.
+
+The practical consequence: if you are in the UK, daily limits and the spend cap
+roll over at midnight in winter and 1am in summer. Further east, later.
 
 ### Surviving a restart
 
@@ -415,7 +437,8 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `AUTH_FAIL_LIMIT` | | Rejected logins before it stops |
 | `MAX_BATCH` | | Messages fetched per pass, default 20; raise `mem_limit` alongside it |
 | `WATCHDOG_SECONDS` | | No progress for this long and it restarts itself, default 1800; `0` disables |
-| `TZ`, `STATE_PATH` | | Timezone, state file location |
+| `STATE_PATH` | | State file location |
+| `TZ` | | Container shell only. The bot forces itself to UTC regardless |
 | `PYTHONUTF8`, `LANG` | | Keep `£`, accents and non-Latin scripts intact |
 
 The allowlists in the environment are **seeds**. Once running, they live in the
@@ -548,18 +571,21 @@ changing any of this — email the bot `spend` and read the searches column.
 python3 tests/run.py
 ```
 
-221 assertions covering parsing, routing, permissions, the content policy,
-limits, cost arithmetic, the scheduled reports and the full message loop. They
-run `bot.py` directly with the network faked out — no mailbox, no API key, no
-state file of your own is touched, and nothing is sent.
+410 assertions covering parsing, routing, permissions, the content policy,
+limits, cost arithmetic, the clock, the scheduled reports and the full message
+loop. They run `bot.py` directly with the network faked out — no mailbox, no API
+key, no state file of your own is touched, and nothing is sent.
 
 ```
 test_admin_and_policy.py         59 passed, 0 failed
-test_audit_regressions.py        44 passed, 0 failed
+test_audit_regressions.py        92 passed, 0 failed
 test_core.py                     83 passed, 0 failed
+test_efficiency.py               54 passed, 0 failed
+test_hardening.py                53 passed, 0 failed
 test_processing.py               35 passed, 0 failed
+test_utc.py                      34 passed, 0 failed
 ----------------------------------------------------
-221 assertions, 0 failures
+410 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

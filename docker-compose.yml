@@ -56,7 +56,9 @@ services:
 
       # ---- behaviour (optional) -------------------------------------------
       FROM_NAME: "AI Assistant"       # display name on replies
-      TZ: "Europe/London"
+      # The bot pins itself to UTC in code; this only matches the container
+      # shell to it. Changing it will NOT move the bot off UTC.
+      TZ: "UTC"
       STATE_PATH: "/data/state.json"
 
       # Some containers default to ASCII, which mangles pound signs, accents
