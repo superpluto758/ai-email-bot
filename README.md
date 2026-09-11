@@ -171,7 +171,8 @@ SYSTEM
   Mailbox:          you@example.com
   Model:            claude-opus-5   (simple questions -> claude-sonnet-5)
   Recording since:  2026-08-12  (16.4 days across 7 starts)
-  Clock:            UTC   (dates and daily limits roll over at 00:00 UTC)
+  Clock:            UTC   (spend cap and report dates roll at 00:00 UTC;
+                       the send caps above are rolling 24h windows)
   This run:         4.2 days   (stopped for 3.1 hours in total)
   People allowed:   5   (may send files: 4)
   Default limit:    30 msg/day
@@ -202,8 +203,12 @@ that would otherwise reflow them.
 ### The clock is UTC
 
 Every date the bot produces is UTC: the spend buckets, the weekly and monthly
-reports, the `Date:` header on replies, the log timestamps, and the moment a
-per-person daily limit resets.
+reports, the daily spend cap, the `Date:` header on replies and the log
+timestamps.
+
+The send caps and per-person limits are not affected, because they were never
+calendar-based — `30/hour` and `30 msg/day` are rolling windows measured back
+from now, so they have no midnight to move.
 
 This is pinned in code, not inherited from the host. Nothing dates itself by
 calling the local clock — a single `now_utc()` is the only way to ask the time,
@@ -217,8 +222,10 @@ answers from the same state file, and a daily limit could reset twice or not at
 all on the day a machine moved. UTC is the only reading that does not depend on
 where the box happens to be.
 
-The practical consequence: if you are in the UK, daily limits and the spend cap
-roll over at midnight in winter and 1am in summer. Further east, later.
+The practical consequence: if you are in the UK, the spend cap resets at
+midnight in winter and 1am in summer. On a NAS previously set to Singapore it
+now resets eight hours later than it used to, and the day it changes over, one
+day's recorded spend is split across two buckets.
 
 ### Surviving a restart
 
@@ -571,7 +578,7 @@ changing any of this — email the bot `spend` and read the searches column.
 python3 tests/run.py
 ```
 
-410 assertions covering parsing, routing, permissions, the content policy,
+415 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
@@ -583,9 +590,9 @@ test_core.py                     83 passed, 0 failed
 test_efficiency.py               54 passed, 0 failed
 test_hardening.py                53 passed, 0 failed
 test_processing.py               35 passed, 0 failed
-test_utc.py                      34 passed, 0 failed
+test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-410 assertions, 0 failures
+415 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

@@ -1455,7 +1455,7 @@ def full_analytics(state, only=None, month=None):
         "  Model:            %s   (simple questions -> %s)"
         % (state.get("model"), SIMPLE_MODEL or "same"),
         "  Recording since:  %s" % recording,
-        "  Clock:            UTC   (dates and daily limits roll over at 00:00 UTC)",
+        "  Clock:            UTC   (spend cap and report dates roll at 00:00 UTC;\n                       the send caps above are rolling 24h windows)",
         "  This run:         %s" % uptime,
         "  People allowed:   %d   (may send files: %d)"
         % (len(state.get("allowlist", [])), len(state.get("file_allowlist", []))),

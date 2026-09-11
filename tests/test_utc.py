@@ -112,6 +112,27 @@ b.user_tally(st3, "friend@example.net")
 ok("tally filed under the UTC month", list(st3["by_user"]) == [UTC_MONTH],
    list(st3["by_user"]))
 
+section("the rolling windows have no midnight to move")
+# The send caps and per-person limits count back 86400 seconds from now. They
+# are not calendar-based, so the clock change must not have touched them - the
+# report wording says so, and this is what makes that true.
+st4 = {"sent_times": [time.time() - 100] * 3}
+ok("send cap counts by elapsed seconds, not by date",
+   b.over_send_limit(st4) is None)
+st5 = {"sent_times": [time.time() - 100] * (b.MAX_SENDS_PER_DAY + 1)}
+ok("cap fires on 24h of traffic", b.over_send_limit(st5) is not None)
+st6 = {"sent_times": [time.time() - 86401] * (b.MAX_SENDS_PER_DAY + 1)}
+ok("traffic older than 24h has aged out, whatever the date",
+   b.over_send_limit(st6) is None)
+st7 = {"sent_to": {"friend@example.net": [time.time() - 100] * 500},
+       "per_user_limits": {"friend@example.net": 2}}
+ok("per-person limit is a rolling window too",
+   b.over_user_limit(st7, "friend@example.net") is not None)
+ok("report says the send caps are rolling, not calendar",
+   "rolling 24h" in b.full_analytics({"model": "m", "allowlist": [],
+                                      "file_allowlist": [], "spend": {},
+                                      "usage": {}}))
+
 section("the Date: header says +0000, not a local offset")
 sent = {}
 real_smtp = b.smtplib.SMTP_SSL
