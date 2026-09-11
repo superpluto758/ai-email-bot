@@ -136,8 +136,15 @@ API_URL = "https://api.anthropic.com/v1/messages"
 # Models that support the dynamic-filtering web search tool. Haiku 4.5 predates
 # it and gets the basic variant instead - sending it the new one is rejected,
 # and it failed invisibly on the trivial tier (every question under 60 chars).
+# Verified against the live API, not inferred from the docs: haiku-4-5 both
+# ACCEPTS web_search_20260209 and actually runs it (server_tool_use +
+# web_search_tool_result blocks come back, searches=1). It was excluded here
+# on the documented release order alone, which cost it the newer tool's
+# dynamic filtering for no reason. Anything genuinely older still gets the
+# _20250305 tool.
 WEB_SEARCH_NEW_MODELS = ("opus-5", "opus-4-8", "opus-4-7", "opus-4-6",
-                         "sonnet-5", "sonnet-4-6", "fable-5", "mythos-5")
+                         "sonnet-5", "sonnet-4-6", "fable-5", "mythos-5",
+                         "haiku-4-5")
 # HTTP codes meaning "the API is having a moment", not "this message is bad".
 TRANSIENT_CODES = (408, 409, 425, 429, 500, 502, 503, 504, 529)
 API_RETRIES = int(os.environ.get("API_RETRIES", "2"))
@@ -1019,9 +1026,16 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
     # The system prompt is identical on every message, so cache it: after the
     # first call each one costs a tenth of that prefix. Anything sender-specific
     # is deliberately kept OUT of it and passed in the user turn instead, or the
-    # prefix would differ per person and never hit. (Haiku 4.5 wants a 4,096
-    # token prefix before anything caches at all, so on the trivial tier this is
-    # a harmless no-op rather than a saving.)
+    # prefix would differ per person and never hit.
+    #
+    # Measured against the live API at the real prompt size (~1,180 tokens):
+    #   opus-5     write 1803 -> read 1803   caches
+    #   sonnet-5   write 1804 -> read 1804   caches
+    #   haiku-4-5  write 0    -> read 0      SILENTLY IGNORED
+    # Haiku 4.5 wants a 4,096-token prefix before anything caches, and below it
+    # the API neither errors nor warns - it just bills full price. So on the
+    # trivial tier this is a harmless no-op, not a saving, and padding the
+    # prompt to reach the minimum would cost more than it saved.
     payload = {
         "model": model,
         "max_tokens": max_tokens,

@@ -303,7 +303,10 @@ b.call_claude = REAL_CALL_CLAUDE
 # question under 60 characters goes to, so the wrong one fails on the
 # commonest path of all. allowed_callers pins the newer tool to direct calls,
 # away from the code-execution caller we never use.
-_EXPECT = {"claude-haiku-4-5": ("web_search_20250305", None),
+# haiku-4-5 was on the old tool until the live probe showed it runs the new
+# one (searches=1, real result blocks). Verified, not assumed.
+_EXPECT = {"claude-haiku-4-5": ("web_search_20260209", ["direct"]),
+           "claude-haiku-3-5": ("web_search_20250305", None),
            "claude-sonnet-5":  ("web_search_20260209", ["direct"]),
            "claude-opus-5":    ("web_search_20260209", ["direct"]),
            "claude-fable-5":   ("web_search_20260209", ["direct"])}

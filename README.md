@@ -662,27 +662,49 @@ Trimming the prompts themselves is not worth it: every fixed token the
 assistant re-sends in a day costs about a penny. Check your own numbers before
 changing any of this — email the bot `spend` and read the searches column.
 
+The system prompt is cached, so after the first call it costs a tenth. That
+works on Opus and Sonnet and **silently does nothing on Haiku 4.5**, which wants
+a 4,096-token prefix before it caches anything — the prompt is ~1,180. Below the
+minimum the API neither errors nor warns, it just bills full price. Padding the
+prompt to reach 4,096 would cost more than it saved, so the trivial tier simply
+pays full price for its prefix. Measured, not assumed:
+
+```
+opus-5     cache_write 1803 -> cache_read 1803   caching
+sonnet-5   cache_write 1804 -> cache_read 1804   caching
+haiku-4-5  cache_write 0    -> cache_read 0      ignored
+```
+
+`live_probe.py` sends the bot's exact request shapes to the real API and prints
+the above, along with which models accept `output_config.effort` and which
+web_search tool version each one will actually run. It costs a fraction of a
+penny, emails nothing and writes no state:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python3 live_probe.py
+```
+
 ## Tests
 
 ```bash
 python3 tests/run.py
 ```
 
-464 assertions covering parsing, routing, permissions, the content policy,
+465 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
 
 ```
 test_admin_and_policy.py         80 passed, 0 failed
-test_audit_regressions.py        96 passed, 0 failed
+test_audit_regressions.py        97 passed, 0 failed
 test_core.py                     89 passed, 0 failed
 test_efficiency.py               55 passed, 0 failed
 test_hardening.py                60 passed, 0 failed
 test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-464 assertions, 0 failures
+465 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect
