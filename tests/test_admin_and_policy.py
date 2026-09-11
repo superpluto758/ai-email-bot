@@ -106,6 +106,37 @@ r = admin({"opus_add":[USER],"reply":"ok"})
 ok("top model granted", b.may_use_opus(st, USER))
 r = admin({"opus_remove":[USER],"reply":"ok"})
 ok("top model revoked", not b.may_use_opus(st, USER))
+
+# Same reasoning as file_add: picking which model answers someone is meaningless
+# if nothing answers them at all.
+r = admin({"opus_add":["h@example.com"],"reply":"ok"})
+ok("top model grant also grants the main allowlist",
+   b.in_list("h@example.com", st["allowlist"]))
+ok("and the top-model grant itself landed", b.may_use_opus(st, "h@example.com"))
+ok("dated like any other add", b.normalize("h@example.com") in st["added_at"])
+ok("both grants reported",
+   "added h@example.com" in r and "top model: h@example.com" in r, r[-160:])
+r = admin({"opus_remove":["h@example.com"],"reply":"ok"})
+ok("dropping to the cheaper model leaves them answerable",
+   b.in_list("h@example.com", st["allowlist"]))
+r = admin({"opus_add":["h@example.com"],"reply":"ok"})
+ok("no duplicate add for an existing member", "added h@example.com" not in r, r[-160:])
+ok("opus_add is idempotent",
+   [b.normalize(a) for a in st["opus_allowlist"]].count(b.normalize("h@example.com")) == 1)
+r = admin({"opus_add":[b.SELF],"reply":"ok"})
+ok("opus_add cannot allowlist the bot itself (mail loop)",
+   not b.in_list(b.SELF, st["allowlist"]))
+r = admin({"opus_add":[b.ADMINS[1]],"reply":"ok"})
+ok("an admin is skipped, not re-added",
+   [b.normalize(a) for a in st["opus_allowlist"]].count(b.normalize(b.ADMINS[1])) == 0)
+
+# Setting a limit is a restriction, not a grant, so it deliberately does NOT
+# open the door - an admin may well cap someone before deciding to add them.
+r = admin({"set_limits":{"capped@example.com":5},"reply":"ok"})
+ok("a limit alone does not allowlist anyone",
+   not b.in_list("capped@example.com", st["allowlist"]))
+ok("but the limit is still recorded for when they are added",
+   (st.get("per_user_limits") or {}).get(b.normalize("capped@example.com")) == 5)
 r = admin({"effort":"max","reply":"ok"})
 ok("effort set", st["effort"]=="max")
 r = admin({"effort":"ultracode","reply":"ok"})

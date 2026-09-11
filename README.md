@@ -23,7 +23,7 @@ another account on someone else's platform.
 - **Searches the web** for anything time-sensitive instead of trusting training
   data that may be out of date
 - **Two permission tiers** — who may write to it at all, and the smaller set
-  who may send files. Granting the second grants the first
+  who may send files. Granting a narrower permission grants the wider one
 - **Admin commands by email** — add and remove people, change tone, switch
   model, request usage stats, all in plain English
 - **Per-user limits** — 30 replies per person per day by default, editable by
@@ -142,15 +142,6 @@ From an admin address, in plain English:
 | Remove someone | `remove alice@example.com from the allowlist` |
 | Let someone send files | `allow alice@example.com to send files` |
 | Revoke file permission | `remove alice@example.com from the file allowlist` |
-
-Granting file permission also adds the person to the main allowlist if they
-are not on it already — one instruction, both tiers. On its own it would be an
-inert grant: an address off the main allowlist is never answered at all, so it
-could attach whatever it liked and get silence back, with the confirmation
-email saying permission had been given. Revoking is deliberately *not* the
-mirror image — it takes attachments away and leaves the person on the main
-allowlist, because "no more files" should not silently stop answering someone
-you still talk to.
 | Change tone | `keep replies shorter and more casual` |
 | Switch model | `use sonnet` / `use opus` / `use haiku` / `use fable` |
 | Analytics | `show me the analytics` / `how's it going?` |
@@ -169,6 +160,32 @@ you still talk to.
 There is no fixed syntax — the request is interpreted, not pattern-matched. The
 reply always ends with an authoritative `Applied:` line written by the code, so
 it cannot claim a change that did not happen.
+
+#### Granting a permission grants the right to write in
+
+Letting someone send files, or use the top model, also adds them to the main
+allowlist if they are not on it already. One instruction, both tiers.
+
+On its own either grant would be inert. An address off the main allowlist is
+never answered at all, so it could attach whatever it liked, or be nominated for
+the most expensive model available, and get silence back — while the
+confirmation email said the permission had been given. Anyone you are choosing
+attachments or models for is plainly someone you deal with.
+
+Revoking is deliberately **not** the mirror image. Taking files away, or
+dropping someone to the cheaper model, leaves them on the main allowlist:
+neither should silently stop answering a person you still talk to.
+
+Setting a limit is the exception, because it is a restriction rather than a
+permission — `set bob@example.com 5 msg/day` records the limit and does not open
+the door. You may well want to cap someone before deciding to add them.
+
+Both grants are named separately in the `Applied:` line, so you can see what
+actually happened:
+
+```
+Applied: added alice@example.com; may now send files: alice@example.com.
+```
 
 ### Analytics
 
@@ -300,7 +317,8 @@ Escalation is checked before length, because "what does this say?" is nineteen
 characters and still needs a model that can see the attached photo.
 
 Grant and revoke with `let alice@example.com use the top model` /
-`stop alice@example.com using the top model`. Models in `NEVER_AUTO_ROUTE` are
+`stop alice@example.com using the top model`. Granting also adds them to the
+main allowlist if they are not on it; revoking leaves them on it. Models in `NEVER_AUTO_ROUTE` are
 never chosen automatically — an admin has to ask for them by name. Set either
 tier to `""` to switch it off.
 
@@ -587,21 +605,21 @@ changing any of this — email the bot `spend` and read the searches column.
 python3 tests/run.py
 ```
 
-427 assertions covering parsing, routing, permissions, the content policy,
+440 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
 
 ```
-test_admin_and_policy.py         69 passed, 0 failed
-test_audit_regressions.py        94 passed, 0 failed
+test_admin_and_policy.py         80 passed, 0 failed
+test_audit_regressions.py        96 passed, 0 failed
 test_core.py                     83 passed, 0 failed
 test_efficiency.py               54 passed, 0 failed
 test_hardening.py                53 passed, 0 failed
 test_processing.py               35 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-427 assertions, 0 failures
+440 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

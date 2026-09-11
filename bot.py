@@ -1929,7 +1929,9 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
               '"model": one of claude-opus-5, claude-sonnet-5, claude-haiku-4-5, '
               'claude-fable-5, or null if no model change was asked for, '
               '"opus_add": [emails] if they asked to let someone use the top '
-              'model, "opus_remove": [emails] if they asked to take that away, '
+              'model - this also lets them email at all, so use it even if they '
+              'are not on the main list yet, '
+              '"opus_remove": [emails] if they asked to take that away, '
               '"effort": "low"|"medium"|"high"|"xhigh"|"max" if they asked you '
               'to think harder or less hard ("max effort", "think as hard as you '
               'can" = max), or null, '
@@ -2058,7 +2060,19 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
     opus = state.setdefault("opus_allowlist", [])
     for addr in parsed.get("opus_add") or []:
         addr = str(addr).strip().lower()
-        if not EMAIL_RE.match(addr) or in_list(addr, opus) or is_admin(addr):
+        if not EMAIL_RE.match(addr) or is_admin(addr):
+            continue          # admins are already on the top model
+        if normalize(addr) == normalize(SELF):
+            continue          # never allowlist ourselves - mail loop
+        # Same reasoning as file_add: choosing which model answers someone is
+        # meaningless if nothing answers them at all. Whoever is told they may
+        # use the top model is plainly someone the admin deals with, so this
+        # grants the allowlist too rather than sitting inert.
+        if not in_list(addr, state["allowlist"]):
+            state["allowlist"].append(addr)
+            state["added_at"][normalize(addr)] = time.time()
+            changes.append("added " + addr)
+        if in_list(addr, opus):
             continue
         opus.append(addr)
         changes.append("may now use the top model: " + addr)
@@ -2069,6 +2083,8 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
             a for a in opus if normalize(a) != normalize(addr)]
         if len(opus) < before:
             changes.append("may no longer use the top model: " + addr)
+    # Not the mirror image, for the same reason file_remove is not: dropping
+    # someone to the cheaper model must not also stop answering them.
     if changes:
         log.info("admin changes: %s", "; ".join(changes))
     # --- apply every requested change first, then build the reply once ------
