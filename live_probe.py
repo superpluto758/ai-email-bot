@@ -147,3 +147,75 @@ for model, tool, name in (("claude-haiku-4-5", WEB_NEW, "_20260209"),
         srv = (u.get("server_tool_use") or {}).get("web_search_requests", 0)
         print("        -> searches=%s  blocks=%s" % (srv, sorted(set(kinds))))
 print()
+
+# --------------------------------------------------------------------------
+# Everything above reconstructs the bot's request shapes by hand, which is
+# exactly how a probe goes stale: it kept testing an opus-5 triage call two
+# commits after the bot stopped sending one. This section imports bot.py and
+# calls the real call_claude, so the payload under test is the one the bot
+# actually builds - tool version, effort, betas, cached system block and all.
+print("\n[7] the REAL code path: bot.call_claude() against the live API")
+import types, tempfile, importlib.util, logging
+
+os.environ.setdefault("MAIL_ADDRESS", "probe@example.com")
+os.environ["STATE_PATH"] = tempfile.mkdtemp() + "/probe-state.json"
+sys.modules["imapclient"] = types.SimpleNamespace(IMAPClient=object)
+_here = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("bot", os.path.join(_here, "bot.py"))
+bot = importlib.util.module_from_spec(_spec)
+sys.modules["bot"] = bot
+_spec.loader.exec_module(bot)
+logging.getLogger("bot").setLevel(logging.ERROR)
+
+
+def real(label, model, question, web_search, effort=None, max_tokens=400,
+         must_search=False):
+    """Drive the bot's own call_claude with the bot's own system prompt.
+
+    must_search says this question cannot be answered from training data. The
+    first version of this probe passed a stripped "Answer in one short
+    sentence." system prompt, so it was not testing the CURRENT FACTS
+    instruction that exists precisely to stop stale answers - and sonnet
+    duly answered from memory and was scored PASS. Use guardrails()."""
+    tool = bot.web_search_tool(model)
+    bot.LAST_CALL.clear()
+    try:
+        out = bot.call_claude(model, bot.guardrails(), question,
+                              max_tokens=max_tokens, web_search=web_search,
+                              effort=effort)
+    except Exception as e:
+        print("  ERR   %-44s %s: %s" % (label, type(e).__name__, e))
+        return
+    u = bot.LAST_CALL.get("usage") or {}
+    searches = bot.LAST_CALL.get("searches", 0)
+    bad = out in (bot.EMPTY_ANSWER, bot.MALFORMED_NOTICE)
+    if must_search and not searches:
+        bad = True
+        label += "  <- ANSWERED FROM MEMORY"
+    print("  %s  %-44s tool=%-19s searches=%s" %
+          ("FAIL" if bad else "PASS", label,
+           tool["type"] if web_search else "(none)", searches))
+    print("        in=%-6s out=%-5s cache_w=%-6s cache_r=%-6s text=%r"
+          % (u.get("input_tokens"), u.get("output_tokens"),
+             u.get("cache_creation_input_tokens"),
+             u.get("cache_read_input_tokens"), (out or "")[:40]))
+
+
+# The tier that changed: haiku is now on web_search_20260209. This proves the
+# bot's own web_search_tool() picks it AND that the call goes through.
+LIVE_Q = "Who is the current Prime Minister of the United Kingdom?"
+
+real("trivial tier, no search (the default)", bot.TRIVIAL_MODEL or "claude-haiku-4-5",
+     "What is 2+2?", web_search=False)
+real("trivial tier WITH search (TRIVIAL_WEB_SEARCH=1)",
+     bot.TRIVIAL_MODEL or "claude-haiku-4-5", LIVE_Q,
+     web_search=True, must_search=True)
+real("main tier + search + effort", "claude-sonnet-5", LIVE_Q,
+     web_search=True, effort="low", must_search=True)
+real("top tier + search + effort + fallbacks", "claude-opus-5", LIVE_Q,
+     web_search=True, effort="low", must_search=True)
+# Second identical sonnet call: the system block is byte-identical, so this is
+# where a cache read should appear if caching is doing anything.
+real("sonnet again - cache read expected", "claude-sonnet-5", LIVE_Q,
+     web_search=True, effort="low", must_search=True)
+print()
