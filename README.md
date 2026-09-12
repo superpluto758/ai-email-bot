@@ -684,6 +684,19 @@ penny, emails nothing and writes no state:
 ANTHROPIC_API_KEY=sk-ant-... python3 live_probe.py
 ```
 
+`mailbox_probe.py` is the other half — it checks the mail side rather than the
+API side. It logs in with the bot's own credentials and reports whether IDLE is
+available (without it the bot polls instead of getting push), how many messages
+are unseen, and whether the `ai-answered` / `ai-denied` / `ai-skipped` labels
+are actually landing — labelling gives up silently after repeated failures, so
+its absence is worth noticing. It is strictly read-only: every fetch uses
+`BODY.PEEK`, the folder is selected `readonly=True`, and nothing is flagged,
+moved, deleted or sent. Safe to run while the bot is running.
+
+```bash
+MAIL_ADDRESS=... MAIL_PASSWORD=... IMAP_HOST=... python3 mailbox_probe.py
+```
+
 ## Tests
 
 ```bash
