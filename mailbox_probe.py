@@ -49,7 +49,31 @@ def hdr(msg, name):
 
 print("connecting to %s as %s" % (HOST, ADDR))
 with IMAPClient(HOST, ssl=True, timeout=60) as server:
-    server.login(ADDR, PW)
+    try:
+        server.login(ADDR, PW)
+    except Exception as exc:
+        # A stack trace helps nobody here, and the failure is nearly always one
+        # of three things. Say them, and stop: the bot depends on this same
+        # login, and a provider that sees repeated failures will lock it out
+        # from everywhere - which would take the assistant down with it.
+        print("  FAIL  login refused: %s" % str(exc)[:120])
+        print("""
+        Not retrying. The bot signs in with these same credentials, and
+        repeated failures get the whole mailbox locked, which would stop it
+        answering anything.
+
+        Usually one of:
+          1. the wrong password. The one that definitely works is in
+             MAIL_PASSWORD in the compose file as DEPLOYED, not in any copy
+             of it that still carries a placeholder
+          2. an account password where the provider wants an app-specific
+             one. With 2FA enabled, most providers refuse the account
+             password over IMAP and issue a separate password per app
+          3. IMAP access switched off for the account, or blocked for a new
+             location - check the provider's security page
+
+        Fix the cause before trying again rather than guessing at passwords.""")
+        sys.exit(1)
     print("  PASS  login accepted")
 
     caps = server.capabilities()
