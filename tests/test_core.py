@@ -200,6 +200,47 @@ for want in ("SYSTEM","Recording since","THIS MONTH, PER PERSON","EMAILS RECEIVE
     ok("analytics has %r" % want, want in full)
 ok("analytics filter narrows", "vip" not in b.full_analytics(st, only=[USER]).lower())
 
+section("who is allowed, by name")
+# A count cannot answer the only question anyone asks of the allowlist - did my
+# change land? Working that out used to mean comparing counts between two weekly
+# reports and guessing which of the +2 was the person you cared about.
+import time as _t, hashlib as _h
+ps = b.load_state()
+ps["allowlist"] = list(b.DEFAULT_ALLOWLIST) + ["late@example.net", "capped@example.net"]
+ps["opus_allowlist"] = ["late@example.net"]
+ps["file_allowlist"] = list(b.DEFAULT_FILE_ALLOWLIST) + ["late@example.net"]
+ps["added_at"] = {"late@example.net": _t.time() - 3 * 86400}
+ps["per_user_limits"] = {"capped@example.net": 5}
+rep = b.people_report(ps)
+ok("every allowed address is named",
+   all(a in rep for a in ps["allowlist"]), rep)
+ok("owners are marked", rep.count("yes") >= 3, rep)
+admin_row = next(l for l in rep.splitlines() if b.ADMINS[0] in l)
+ok("an owner shows as owner", admin_row.split()[1] == "yes", admin_row)
+ok("an owner is unlimited", "unlimited" in admin_row, admin_row)
+late_row = next(l for l in rep.splitlines() if "late@example.net" in l)
+ok("file permission is shown", late_row.split()[2] == "yes", late_row)
+ok("top-model permission is shown", late_row.split()[3] == "yes", late_row)
+ok("the date they were added is shown",
+   _t.strftime("%Y-%m-%d", _t.gmtime(_t.time() - 3 * 86400)) in late_row, late_row)
+capped_row = next(l for l in rep.splitlines() if "capped@example.net" in l)
+ok("a custom limit is shown", "5/day" in capped_row, capped_row)
+ok("someone seeded in the environment says so", "at setup" in rep)
+ok("an empty allowlist says so plainly",
+   b.people_report({"allowlist": []}) == "Nobody is on the allowlist.")
+ok("it appears in the analytics report", "PEOPLE ALLOWED" in b.full_analytics(ps))
+
+section("which build is actually running")
+# The container writes bot.py out of the compose and runs it, so the version
+# live on the box could only be inferred from whether some new line showed up
+# in a report. That guesswork cost a long misdiagnosis, twice.
+ok("BUILD is the sha256 of this very file",
+   b.BUILD == _h.sha256(open(BOT, "rb").read()).hexdigest()[:8], b.BUILD)
+ok("it is short enough to read aloud", len(b.BUILD) == 8, b.BUILD)
+ok("the report states it", "Build:" in b.full_analytics(ps) and b.BUILD in b.full_analytics(ps))
+ok("an unreadable source degrades rather than crashing",
+   b.build_id.__doc__ and "unknown" in open(BOT).read())
+
 section("what it calls itself")
 # One name, two places. Before this the From: display name and the sentence the
 # model introduces itself with were set independently, so renaming the bot left

@@ -223,6 +223,7 @@ SYSTEM
   Recording since:  2026-08-12  (16.4 days across 7 starts)
   Clock:            UTC   (spend cap and report dates roll at 00:00 UTC;
                        the send caps above are rolling 24h windows)
+  Build:            60337b7d   (sha256 of the running bot.py)
   This run:         4.2 days   (stopped for 3.1 hours in total)
   People allowed:   5   (may send files: 4)
   Default limit:    30 msg/day
@@ -235,6 +236,27 @@ User                    sent   recv   input tok  output tok searches         £
 alice@example.com          9      8     900,000     200,000       12     £7.60
 bob@example.com            6      4     400,000      90,000        3     £3.38
 ```
+
+The same report lists who is actually allowed, by name:
+
+```
+PEOPLE ALLOWED
+Address                  owner  files  top model  limit      added
+------------------------------------------------------------------
+alice@example.com        -      yes    -          30/day     2026-09-10
+you@example.com          yes    yes    yes        unlimited  at setup
+```
+
+A count could never answer the only question anyone asks of the allowlist —
+*did my change land?* Working that out used to mean comparing the count between
+two weekly reports and guessing which of the new entries was the person you
+cared about.
+
+`Build` is the sha256 of the `bot.py` actually running. The container writes the
+source out of the compose file and runs it, so otherwise the live version can
+only be inferred from whether some new line has appeared in a report — guesswork
+that has caused more than one long misdiagnosis. Hashing the file needs no
+version number anyone has to remember to bump.
 
 `sent` is what they emailed in, `recv` is what they got back — a gap between
 them means messages were declined, rate limited or skipped.
@@ -764,7 +786,7 @@ MAIL_ADDRESS=... MAIL_PASSWORD=... IMAP_HOST=... python3 mailbox_probe.py
 python3 tests/run.py
 ```
 
-513 assertions covering parsing, routing, permissions, the content policy,
+528 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
@@ -773,13 +795,13 @@ key, no state file of your own is touched, and nothing is sent.
 test_admin_and_policy.py         80 passed, 0 failed
 test_attachments.py              39 passed, 0 failed
 test_audit_regressions.py        97 passed, 0 failed
-test_core.py                     89 passed, 0 failed
+test_core.py                     104 passed, 0 failed
 test_efficiency.py               55 passed, 0 failed
 test_hardening.py                69 passed, 0 failed
 test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-513 assertions, 0 failures
+528 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

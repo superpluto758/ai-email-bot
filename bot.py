@@ -8,6 +8,7 @@ senders with Claude. Ported from the Google Apps Script version.
 
 import base64
 import email
+import hashlib
 import html
 import io
 import json
@@ -215,6 +216,24 @@ IGNORE_SENDERS = _addresses("IGNORE_SENDERS")
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger("bot")
+
+
+def build_id():
+    """A short fingerprint of this exact source file.
+
+    The container writes bot.py out of the compose file and runs it, so there
+    was no way to tell which version was actually live - it had to be inferred
+    from whether some new line showed up in a report, which is guesswork and
+    has already caused one long misdiagnosis. Hashing the file needs no version
+    number to remember to bump: it simply is what is running."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:8]
+    except Exception:
+        return "unknown"
+
+
+BUILD = build_id()
 
 
 # ----------------------------------------------------------------- state ---
@@ -1763,6 +1782,34 @@ def cost_by_user(state, month=None, only=None):
     return "\n".join(out)
 
 
+def people_report(state):
+    """Who is allowed, by name.
+
+    The SYSTEM block only ever gave a count, and a count cannot answer the one
+    question anybody actually asks about the allowlist: did my change land?"""
+    allowed = sorted(state.get("allowlist") or [], key=normalize)
+    if not allowed:
+        return "Nobody is on the allowlist."
+    files = state.get("file_allowlist") or DEFAULT_FILE_ALLOWLIST
+    opus = state.get("opus_allowlist") or []
+    added = state.get("added_at") or {}
+    width = max(24, min(40, max(len(a) for a in allowed)))
+    row = "%-*s %-6s %-6s %-10s %-10s %s"
+    out = [row % (width, "Address", "owner", "files", "top model", "limit", "added"),
+           "-" * (width + 44)]
+    for addr in allowed:
+        limit = user_daily_limit(state, addr)
+        when = added.get(normalize(addr))
+        out.append(row % (
+            width, addr[:width],
+            "yes" if is_admin(addr) else "-",
+            "yes" if in_list(addr, files) else "-",
+            "yes" if is_admin(addr) or in_list(addr, opus) else "-",
+            "unlimited" if limit is None else "%d/day" % limit,
+            ts_utc(when).strftime("%Y-%m-%d") if when else "at setup"))
+    return "\n".join(out)
+
+
 def full_analytics(state, only=None, month=None):
     """Everything an owner might want, in one reply.
 
@@ -1793,6 +1840,7 @@ def full_analytics(state, only=None, month=None):
         % (state.get("model"), SIMPLE_MODEL or "same"),
         "  Recording since:  %s" % recording,
         "  Clock:            UTC   (spend cap and report dates roll at 00:00 UTC;\n                       the send caps above are rolling 24h windows)",
+        "  Build:            %s   (sha256 of the running bot.py)" % BUILD,
         "  This run:         %s" % uptime,
         "  People allowed:   %d   (may send files: %d)"
         % (len(state.get("allowlist", [])), len(state.get("file_allowlist", []))),
@@ -1810,6 +1858,9 @@ def full_analytics(state, only=None, month=None):
         "",
         "THIS MONTH, PER PERSON (%s)%s" % (month, " - filtered" if only else ""),
         cost_by_user(state, month, only),
+        "",
+        "PEOPLE ALLOWED",
+        people_report(state),
         "",
         "EMAILS RECEIVED PER PERSON",
         usage_report(state, only),
