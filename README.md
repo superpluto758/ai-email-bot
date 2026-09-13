@@ -16,8 +16,9 @@ another account on someone else's platform.
 ## What it does
 
 - **Answers email** from addresses you allow, in the sender's own language
-- **Reads attachments** — photos, PDFs, and text files go to the model as real
-  content, so "what does this say?" works on a photographed page
+- **Reads attachments** — photos, PDFs, Word, PowerPoint, Excel, CSV and text
+  files, so "what does this say?" works on a photographed page and "mark this
+  essay" works on the .docx
 - **Understands forwards**, including emails attached as `.eml`, and always
   replies to the person who forwarded rather than anyone quoted inside
 - **Searches the web** for anything time-sensitive instead of trusting training
@@ -535,11 +536,57 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `WATCHDOG_SECONDS` | | No progress for this long and it restarts itself, default 1800; `0` disables |
 | `STATE_PATH` | | State file location |
 | `TZ` | | Container shell only. The bot forces itself to UTC regardless |
+| `OFFICE_MAX_TEXT` | | Characters kept from a Word/PowerPoint/Excel file, default 20000 |
 | `FROM_NAME` | | What it is called — the `From:` display name **and** the name it introduces itself with |
 | `PYTHONUTF8`, `LANG` | | Keep `£`, accents and non-Latin scripts intact |
 
 The allowlists in the environment are **seeds**. Once running, they live in the
 state file and are changed by email.
+
+### What it can open
+
+| Kind | How it is read |
+|---|---|
+| JPEG, PNG, GIF, WebP | Sent to the model as an image — it looks at the picture |
+| PDF | Sent whole, as a document — layout and images included |
+| Word (`.docx`, `.docm`) | Text extracted here, paragraph by paragraph |
+| PowerPoint (`.pptx`, `.pptm`) | Text per slide, **plus the speaker notes** |
+| Excel (`.xlsx`, `.xlsm`) | Each sheet as rows, under its tab name |
+| CSV, TSV, TXT, MD, JSON, XML, YAML, logs | Sent as text |
+| `.eml` forwards | Unpacked — headers and body, images inside included |
+
+Office files are zip archives of XML, so the standard library reads all three
+and the container needs no extra package. That matters more than elegance: the
+bot ships as a single base64 blob inside the compose file and pip-installs one
+dependency at boot, so every library added is another thing that can fail on a
+restart.
+
+**Type is decided by content, never by name.** A `.docx` arrives as
+`application/octet-stream` from most clients and a `.csv` as
+`application/vnd.ms-excel` — trusting the label was the whole reason Word
+documents were never read. A zip containing `word/document.xml` is a Word file
+whatever it is called; a file starting `%PDF` is a PDF whatever its extension
+says. A sender can set the label to anything, so it is only ever a hint.
+
+Only the extracted text is sent, never the file, so Office documents get a
+larger size allowance (10 MB) than images and PDFs (4 MB), which are uploaded
+whole. A photo-heavy deck is routinely over 4 MB and holds two paragraphs.
+
+What it will not open, and says so plainly rather than ignoring:
+
+- **`.doc`, `.xls`, `.ppt`** — the pre-2007 binary formats. The sender is told
+  to re-save as `.docx` and why.
+- **A deck or document with no text in it** — all screenshots, or a spreadsheet
+  whose formulas have never been calculated, so no value was ever stored.
+- **Anything built to be hostile.** A part carrying a DTD is refused (Office
+  files never have one, and the parser would expand nested entities until the
+  process died), as is any part claiming to decompress past 8 MB. Both become
+  an ordinary "could not be opened" note, never a crash.
+
+Extracted text is capped at `OFFICE_MAX_TEXT` (20,000 characters) and the model
+is told where it came from: that it is document content rather than instructions
+to it, and that layout and images are gone so it should not comment on how the
+document looks.
 
 ### HTML-only mail
 
@@ -618,6 +665,8 @@ Things that go wrong in the field, and what the bot does about them:
 - **Signature logos are not attachments.** Small inline images a mail client
   adds by itself are ignored, so ordinary text mail is not declined as though
   the sender attached a file.
+- **An attachment is judged by its contents, not its name.** Mail clients label
+  files badly, and a sender can label one anything they like.
 
 ---
 
@@ -703,13 +752,14 @@ MAIL_ADDRESS=... MAIL_PASSWORD=... IMAP_HOST=... python3 mailbox_probe.py
 python3 tests/run.py
 ```
 
-465 assertions covering parsing, routing, permissions, the content policy,
+504 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
 
 ```
 test_admin_and_policy.py         80 passed, 0 failed
+test_attachments.py              39 passed, 0 failed
 test_audit_regressions.py        97 passed, 0 failed
 test_core.py                     89 passed, 0 failed
 test_efficiency.py               55 passed, 0 failed
@@ -717,7 +767,7 @@ test_hardening.py                60 passed, 0 failed
 test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-465 assertions, 0 failures
+504 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect
