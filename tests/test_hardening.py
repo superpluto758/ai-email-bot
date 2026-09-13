@@ -329,6 +329,22 @@ ok("it runs unconditionally, at loop level",
    "\n                    process_unseen(server, state)\n" in loop, repr(loop[-90:]))
 ok("a held message still logs that it is being retried", "held - retrying" in loop)
 
+section("a placeholder secret stops the bot before it tries anything")
+# Both secrets ship as PASTE_... in the compose and have to be retyped on every
+# redeploy. Forgetting used to be silent: a placeholder MAIL_PASSWORD means the
+# IMAP login is refused, nothing is read, and from outside that looks exactly
+# like a quiet mailbox. It cost 20 minutes of live debugging to find.
+main_src = src[src.index("def main():"):]
+main_src = main_src[:main_src.index("state = load_state()")]
+ok("startup checks for the placeholder", 'startswith("PASTE")' in main_src)
+ok("it refuses to start", "NOT STARTING" in main_src)
+ok("it exits rather than carrying on", "sys.exit(1)" in main_src)
+ok("it says nothing was tried against the mail server",
+   "Nothing was" in main_src and "locked out" in main_src)
+ok("the compose really does ship placeholders that start with PASTE",
+   all(v.upper().startswith("PASTE") for v in
+       ("PASTE_ZOHO_APP_PASSWORD_HERE", "PASTE_ANTHROPIC_API_KEY_HERE")))
+
 print("\n%d passed, %d failed" % (P, F))
 for f in FAILS: print("   FAILED:", f)
 sys.exit(1 if F else 0)

@@ -3721,6 +3721,25 @@ def main():
     if missing:
         log.error("missing required setting(s): %s", ", ".join(missing))
         sys.exit(1)
+    # The compose file ships with both secrets as PASTE_... placeholders, so
+    # anyone redeploying has to retype them every time - and forgetting is
+    # silent. A placeholder MAIL_PASSWORD means the IMAP login is refused, the
+    # bot reads nothing, and from the outside that is indistinguishable from a
+    # quiet mailbox. Worse, retrying a bad password is how a mail account gets
+    # locked. Refuse to start, loudly, rather than attempt a single login.
+    placeholders = [n for n, v in (("MAIL_PASSWORD", APP_PASSWORD),
+                                   ("ANTHROPIC_API_KEY", API_KEY))
+                    if v.upper().startswith("PASTE")]
+    if placeholders:
+        log.error("=" * 70)
+        log.error("NOT STARTING: %s still hold%s the placeholder from the "
+                  "compose file.", " and ".join(placeholders),
+                  "s" if len(placeholders) == 1 else "")
+        log.error("Put the real value on that line and redeploy. Nothing was")
+        log.error("tried against the mail server - repeated bad logins are how")
+        log.error("an account gets locked out.")
+        log.error("=" * 70)
+        sys.exit(1)
 
     state = load_state()
     now = time.time()
