@@ -310,6 +310,25 @@ ok("policy still requires admitting it is an AI", "admit you are an AI" in pol)
 ok("guardrails still introduce it as an AI assistant",
    "AI assistant" in b.guardrails())
 
+section("the mailbox is swept even when the server says nothing")
+# Observed live: the bot connected, sat in IDLE, and answered nothing for
+# fifteen minutes. idle_check returned empty every cycle without ever raising,
+# so the loop kept completing, kick() kept the watchdog satisfied and
+# last_active kept the healthcheck green. A push signal that silently stops
+# arriving is indistinguishable from a quiet mailbox, so it cannot be the only
+# thing that triggers a scan.
+src = open(BOT).read()
+loop = src[src.index("while True:\n                    server.idle()"):]
+loop = loop[:loop.index("except KeyboardInterrupt")]
+ok("the loop calls process_unseen exactly once", loop.count("process_unseen(server, state)") == 1,
+   loop.count("process_unseen(server, state)"))
+ok("and not inside the 'if responses' branch",
+   "log.info(\"new mail signal: %s\", responses[:3])\n                        process_unseen" not in loop)
+# The call must sit at the loop's own indentation, not nested in a conditional.
+ok("it runs unconditionally, at loop level",
+   "\n                    process_unseen(server, state)\n" in loop, repr(loop[-90:]))
+ok("a held message still logs that it is being retried", "held - retrying" in loop)
+
 print("\n%d passed, %d failed" % (P, F))
 for f in FAILS: print("   FAILED:", f)
 sys.exit(1 if F else 0)

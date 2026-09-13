@@ -659,6 +659,12 @@ Things that go wrong in the field, and what the bot does about them:
 - **A mailbox renumber is detected** (UIDVALIDITY), which would otherwise leave
   the bot scanning above every new message forever while the weekly heartbeat
   kept reporting it healthy.
+- **The mailbox is swept on a timer as well as on push.** IMAP IDLE can stop
+  delivering notifications without ever erroring — the loop keeps completing,
+  the watchdog stays satisfied and the healthcheck stays green, while nothing
+  gets answered. Every IDLE cycle now scans above the watermark regardless of
+  whether the server said anything, which costs one `SEARCH` on a quiet
+  mailbox.
 - **Quoted text never changes a setting.** An address only takes effect if the
   admin typed it in that message — alerts quote strangers verbatim and invite a
   reply, so quoted text is treated as data, never as an instruction.
@@ -752,7 +758,7 @@ MAIL_ADDRESS=... MAIL_PASSWORD=... IMAP_HOST=... python3 mailbox_probe.py
 python3 tests/run.py
 ```
 
-504 assertions covering parsing, routing, permissions, the content policy,
+508 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
@@ -763,11 +769,11 @@ test_attachments.py              39 passed, 0 failed
 test_audit_regressions.py        97 passed, 0 failed
 test_core.py                     89 passed, 0 failed
 test_efficiency.py               55 passed, 0 failed
-test_hardening.py                60 passed, 0 failed
+test_hardening.py                64 passed, 0 failed
 test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-504 assertions, 0 failures
+508 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

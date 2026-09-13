@@ -3798,14 +3798,23 @@ def main():
                     maybe_reports(state)
                     if responses:
                         log.info("new mail signal: %s", responses[:3])
-                        process_unseen(server, state)
                     elif state.get("held_uids"):
-                        # Nothing new arrived, but something is waiting on a
-                        # retry. Without this it waited for an unrelated
-                        # stranger to write in - potentially forever.
+                        # Something is waiting on a retry. Without a sweep here
+                        # it waited for an unrelated stranger to write in -
+                        # potentially forever.
                         log.info("%d message(s) held - retrying",
                                  len(state["held_uids"]))
-                        process_unseen(server, state)
+                    # Sweep on EVERY cycle, signal or not. An IDLE connection
+                    # can stop delivering notifications without ever raising:
+                    # idle_check just returns empty each time, the loop keeps
+                    # completing, kick() keeps the watchdog happy and
+                    # last_active keeps the healthcheck green - while the bot
+                    # answers nothing at all. Observed live: connected 15:42:37,
+                    # three emails at 15:50 and 15:56, not one log line and no
+                    # reply. Trusting the push signal alone is what made that
+                    # silent. The sweep is one IMAP SEARCH above the watermark
+                    # and costs nothing when the mailbox is quiet.
+                    process_unseen(server, state)
         except KeyboardInterrupt:
             log.info("shutting down")
             return
