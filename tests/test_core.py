@@ -230,6 +230,25 @@ ok("an empty allowlist says so plainly",
    b.people_report({"allowlist": []}) == "Nobody is on the allowlist.")
 ok("it appears in the analytics report", "PEOPLE ALLOWED" in b.full_analytics(ps))
 
+section("the exchange rate is applied, not assumed")
+# The rate is hand-set and drifts - it sat at 0.79 while the real rate was
+# 0.7549, overstating every figure by 4.6%. What matters is that the number the
+# report PRINTS is the number it actually divided by, so a stale rate is always
+# visible rather than silently baked in.
+rs = {"spend": {"2026-09": {"in": 1000, "out": 100, "searches": 0, "usd": 10.0}},
+      "spend_week": {}, "by_user": {}}
+rep = b.spend_report(rs)
+ok("the report states the rate it used",
+   "%.2f USD->GBP" % b.USD_TO_GBP in rep, rep.splitlines()[-1])
+expected = "%s%.2f" % (b.CURRENCY, 10.0 * b.USD_TO_GBP)
+ok("and converts by exactly that rate", expected in rep, (expected, rep))
+ok("the rate is a plausible USD->GBP figure, not a typo",
+   0.5 < b.USD_TO_GBP < 1.0, b.USD_TO_GBP)
+# The spend cap is denominated in USD, so the rate must not touch it.
+ok("the daily cap stays in USD", isinstance(b.DAILY_SPEND_CAP_USD, float))
+ok("changing the rate cannot change the cap",
+   "USD_TO_GBP" not in open(BOT).read().split("def over_spend_cap")[1][:400])
+
 section("which build is actually running")
 # The container writes bot.py out of the compose and runs it, so the version
 # live on the box could only be inferred from whether some new line showed up

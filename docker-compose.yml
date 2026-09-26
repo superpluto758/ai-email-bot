@@ -103,7 +103,10 @@ services:
 
       # Reports are shown in your currency. Anthropic bills in USD; this is a
       # fixed rate, not a live lookup.
-      USD_TO_GBP: "0.79"
+      # Spot mid-rate on 2026-09-26. A hand-set figure, so it drifts:
+      # the reports say what it was converted at, and the Anthropic
+      # console in USD is the authority.
+      USD_TO_GBP: "0.7549"
       CURRENCY_SYMBOL: "£"
 
       # ---- model routing ---------------------------------------------------

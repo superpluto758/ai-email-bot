@@ -543,7 +543,7 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `MAX_SENDS_PER_HOUR` / `MAX_SENDS_PER_DAY` | | Send caps |
 | `PER_USER_DAILY_LIMIT` | | Replies per person per day, default 30; admins exempt |
 | `WEEKLY_REPORT_DAYS` / `MONTHLY_REPORT` / `YEARLY_REPORT` | | Scheduled summaries; `0` disables |
-| `USD_TO_GBP` / `CURRENCY_SYMBOL` | | Currency for reports |
+| `USD_TO_GBP` / `CURRENCY_SYMBOL` | | Currency for reports. The rate is hand-set and drifts — every report states the rate it used, and the Anthropic console in USD is the authority |
 | `MEMORY_ENABLED` / `MEMORY_MAX_CHARS` | | Remembering people between emails |
 | `MEMORY_NOTE_MAX_CHARS` | | Longest single stored note, default 200 |
 | `DAILY_SPEND_CAP_USD` | | Daily API spend backstop, default 10. Mail is held, not lost; admins exempt; `0` disables |

@@ -812,7 +812,10 @@ WEB_SEARCH_USD = 0.01          # per search
 
 # Anthropic bills in USD; reports are shown in GBP. This is a fixed rate rather
 # than a live lookup - set it to whatever your card is actually converting at.
-USD_TO_GBP = float(os.environ.get("USD_TO_GBP", "0.79"))
+# Only a fallback - the deployment sets this. Hand-set either way, so it
+# drifts; every report states the rate it used and points at the Anthropic
+# console, in USD, as the authority. 0.7549 was the spot mid on 2026-09-26.
+USD_TO_GBP = float(os.environ.get("USD_TO_GBP", "0.7549"))
 def _fix_mojibake(text):
     """Undo UTF-8 bytes that were read as Latin-1 (turns "\u00c2\u00a3" back into "\u00a3").
 
