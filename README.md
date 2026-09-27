@@ -500,8 +500,12 @@ message**, with quoted lines stripped:
 - settings that name an address — allowlist, file permission, top-model
   permission, per-person limits, forgetting someone — need that address typed
   by you
-- settings that name no address — the reply style, the model, the effort level
-  — need you to have mentioned that setting in your own words
+- settings that name no address need the new value itself in your own words:
+  the model by name ("use sonnet"), the effort level by name ("set effort to
+  high", or "as hard as you can" for max), and a new reply style mostly in the
+  words you used. Mentioning the topic is not enough — "thanks, I'll reply to
+  them myself" contains "reply", and used to let a style lifted from a
+  stranger's quoted message apply to every sender
 
 Anything reached only through quoted text is dropped, and the reply tells you
 which ones and why, so you can simply say it again. This is enforced in code,
@@ -510,13 +514,25 @@ by whoever is attacking it.
 
 ### Sender authentication
 
-`ADMIN_ADDRESSES` is checked in code, but a `From:` header is trivially forged,
-and an admin address is the most valuable thing to forge here. So when a message
-claims to come from an admin, the receiving server's own `Authentication-Results`
-verdict has to agree: an explicit SPF/DKIM/DMARC **failure** means the message is
-refused unread and you get an alert. A missing header is not treated as a
-failure — plenty of servers do not add one — so this costs nothing on a normal
-mailbox and closes the impersonation route on one that does.
+A `From:` header is trivially forged, so the bot reads the verdict your own mail
+server wrote in its `Authentication-Results` header — only that one header, never
+one the sender added further down, and parsed rather than searched for
+`dmarc=pass`. A pass only counts if it is **aligned**: DMARC passed, or DKIM or SPF
+passed for the From domain itself. A pass for some other domain the sender owns
+is not a pass.
+
+- **Admin mail must be verified.** No aligned pass, or no header at all, and it
+  is refused unread and you get an alert. This fails closed on purpose: an admin
+  address can rewrite the allowlist, the model and the style every other
+  sender's prompt is built from.
+- **Allowlisted mail is refused when the server checked and nothing vouched for
+  it**, so nobody can make the bot write to your friends in your name, on their
+  quota and your bill. Mail with no header at all is still answered.
+
+Set `AUTHSERV_ID` to the name your provider writes at the start of that header
+(open any message's source and copy the part before the first `;`). If your
+provider adds no header at all, every admin message is refused; the last resort
+is `ALLOW_UNVERIFIED_ADMIN=1`, which reopens impersonation.
 
 ---
 
@@ -786,7 +802,7 @@ MAIL_ADDRESS=... MAIL_PASSWORD=... IMAP_HOST=... python3 mailbox_probe.py
 python3 tests/run.py
 ```
 
-528 assertions covering parsing, routing, permissions, the content policy,
+565 assertions covering parsing, routing, permissions, the content policy,
 limits, cost arithmetic, the clock, the scheduled reports and the full message
 loop. They run `bot.py` directly with the network faked out — no mailbox, no API
 key, no state file of your own is touched, and nothing is sent.
@@ -795,13 +811,13 @@ key, no state file of your own is touched, and nothing is sent.
 test_admin_and_policy.py         80 passed, 0 failed
 test_attachments.py              39 passed, 0 failed
 test_audit_regressions.py        97 passed, 0 failed
-test_core.py                     104 passed, 0 failed
+test_core.py                     109 passed, 0 failed
 test_efficiency.py               55 passed, 0 failed
-test_hardening.py                69 passed, 0 failed
+test_hardening.py                104 passed, 0 failed
 test_processing.py               45 passed, 0 failed
 test_utc.py                      39 passed, 0 failed
 ----------------------------------------------------
-528 assertions, 0 failures
+565 assertions, 0 failures
 ```
 
 `test_audit_regressions.py` is worth reading on its own: each case is a defect

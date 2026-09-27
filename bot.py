@@ -378,7 +378,19 @@ def is_admin(addr):
     return in_list(addr, ADMINS)
 
 
-AUTH_RESULT_RE = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*(\w+)", re.I)
+# The receiving server's name as it writes it at the start of its
+# Authentication-Results header ("mx.fastmail.com", "mx.zohomail.eu", ...). When set,
+# only a header carrying that name is believed; when unset, only the topmost
+# one is. Either way a header the SENDER wrote lower down is never read - that
+# is the whole point, since anyone can type "dmarc=pass" into their own mail.
+AUTHSERV_ID = os.environ.get("AUTHSERV_ID", "").strip().lower()
+# Escape hatch for a provider that stamps no Authentication-Results at all.
+# With it on, a forged From: of an admin address is an admin again - do not set
+# it unless the alternative is having no email control whatsoever.
+ALLOW_UNVERIFIED_ADMIN = os.environ.get("ALLOW_UNVERIFIED_ADMIN", "0") \
+    not in ("0", "false", "no")
+AUTH_METHOD_RE = re.compile(r"^\s*(spf|dkim|dmarc)\s*=\s*([a-z]+)(.*)$", re.I | re.S)
+AUTH_PROP_RE = re.compile(r"\b([a-z]+)\.([a-z0-9_-]+)\s*=\s*([^\s;]+)", re.I)
 
 
 # Questions about the assistant's own machinery: who owns it, who else may
@@ -435,36 +447,97 @@ def system_probe(text):
     return bool(SYSTEM_PROBE_RE.search(text or ""))
 
 
-def authentication_ok(msg):
-    """What the receiving mail server said about where this message came from.
+def _strip_comments(text):
+    """Drop RFC 5322 (comments), innermost first - they are free text, and a
+    sender's own words can end up inside them."""
+    prev = None
+    while prev != text:
+        prev, text = text, re.sub(r"\([^()]*\)", " ", text)
+    return text
 
-    True  - it verified the sending domain
-    False - it says verification FAILED
-    None  - nothing to go on (no header, or only neutral results)
 
-    A From address is trivially forged, and an admin address is by far the most
-    valuable one to forge here: it turns any stranger into someone who can
-    change the model, the reply style and the allowlist. Absence of the header
-    is not treated as failure - plenty of servers do not add it - but an
-    explicit failure is."""
-    results = " ".join(msg.get_all("Authentication-Results") or [])
+def _aligned(domain, from_domain):
+    """Relaxed DMARC alignment without a public-suffix list: the same domain,
+    or one a subdomain of the other. Either way the signer controls DNS for
+    part of the From domain's own tree, which a stranger cannot."""
+    domain = (domain or "").strip().strip(".").lower()
+    from_domain = (from_domain or "").strip().strip(".").lower()
+    if not domain or not from_domain or "." not in domain:
+        return False
+    return (domain == from_domain or from_domain.endswith("." + domain)
+            or domain.endswith("." + from_domain))
+
+
+def _trusted_auth_header(msg):
+    """The one Authentication-Results header written by our own mail server.
+
+    Servers prepend, so ours sits above anything the sender put in the message
+    themselves. With AUTHSERV_ID set, it is picked by name instead, which also
+    survives a provider that stamps several."""
+    headers = [str(h) for h in (msg.get_all("Authentication-Results") or [])]
+    if not headers:
+        return None
+    if not AUTHSERV_ID:
+        return headers[0]
+    for h in headers:
+        ident = _strip_comments(h).split(";", 1)[0].strip().lower()
+        ident = ident.split()[0] if ident else ""
+        if ident == AUTHSERV_ID or ident.endswith("." + AUTHSERV_ID):
+            return h
+    return None
+
+
+def authentication_ok(msg, sender=None):
+    """Did our mail server verify that this really came from the From domain?
+
+    True  - an ALIGNED pass: DMARC passed, or DKIM/SPF passed for the From
+            domain itself
+    False - the server checked, and nothing it checked vouches for the From
+            domain (including an explicit failure)
+    None  - nothing to go on: no header from our server, or it checked nothing
+
+    A pass for some other domain is not a pass. Anyone can send from a domain
+    they own with perfect SPF and DKIM and put an admin's address in From:,
+    and the old check counted exactly that as verified. Only our own server's
+    header is read, and it is parsed rather than grepped: "dmarc=pass" typed
+    into a sender's own header, or into an envelope address, used to count."""
+    sender = sender or parseaddr(msg.get("From", ""))[1]
+    from_domain = sender.rpartition("@")[2].lower()
+    raw = _trusted_auth_header(msg)
+    if raw is None:
+        return None
+    segments = _strip_comments(raw).split(";")[1:]     # [0] is the server's name
+    results = []
+    for seg in segments:
+        found = AUTH_METHOD_RE.match(seg)
+        if not found:
+            continue
+        method, verdict, rest = found.group(1).lower(), found.group(2).lower(), found.group(3)
+        props = {("%s.%s" % (p, k)).lower(): v.strip('"<>').lower()
+                 for p, k, v in AUTH_PROP_RE.findall(rest)}
+        results.append((method, verdict, props))
     if not results:
         return None
-    found = {}
-    for method, verdict in AUTH_RESULT_RE.findall(results):
-        found.setdefault(method.lower(), verdict.lower())
-    if not found:
-        return None
-    if found.get("dmarc") == "pass":
-        return True
-    if found.get("dmarc") in ("fail", "quarantine", "reject"):
-        return False
-    # No DMARC verdict to go on, so fall back to what it was built from.
-    if found.get("dkim") == "pass" or found.get("spf") == "pass":
-        return True
-    if found.get("dkim") == "fail" or found.get("spf") in ("fail", "softfail"):
-        return False
-    return None
+    for method, verdict, props in results:
+        if verdict != "pass":
+            continue
+        if method == "dmarc":
+            # DMARC is judged on a From domain. If the server says which one,
+            # it has to be this one - a message with two From headers can have
+            # been judged on the other.
+            judged = props.get("header.from")
+            if not judged or _aligned(judged, from_domain):
+                return True
+        elif method == "dkim":
+            signer = props.get("header.d") or \
+                props.get("header.i", "").rpartition("@")[2]
+            if _aligned(signer, from_domain):
+                return True
+        elif method == "spf":
+            envelope = props.get("smtp.mailfrom") or props.get("smtp.helo", "")
+            if _aligned(envelope.rpartition("@")[2], from_domain):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------- parsing --
@@ -746,6 +819,10 @@ MAGIC = ((b"\x89PNG\r\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"),
          (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"),
          (b"%PDF", PDF_TYPE))
 OFFICE_MAX_PART = 8 * 1024 * 1024         # one XML part, uncompressed
+# All the XML in one document together. A 200-page essay is under 5 MB of it;
+# this is what keeps a crafted file to seconds rather than an hour.
+OFFICE_MAX_TOTAL = 24 * 1024 * 1024
+OFFICE_MAX_MEMBERS = 5000
 OFFICE_MAX_TEXT = int(os.environ.get("OFFICE_MAX_TEXT", "20000"))
 DTD_RE = re.compile(rb"<!(?:DOCTYPE|ENTITY)", re.I)
 MAX_ONE_ATTACHMENT = 4 * 1024 * 1024      # API caps individual images
@@ -892,7 +969,9 @@ def _office_xml(zf, name):
         raise ValueError("%s is %.1f MB uncompressed"
                          % (name, info.file_size / 1048576))
     raw = zf.read(name)
-    if DTD_RE.search(raw[:4096]):
+    # The whole part, not the first 4 KB: a DOCTYPE may follow any amount of
+    # comment, and a check that only looks at the start is a padding exercise.
+    if DTD_RE.search(raw):
         raise ValueError("%s carries a DTD" % name)
     return ET.fromstring(raw)
 
@@ -1039,6 +1118,16 @@ def office_text(data):
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = set(zf.namelist())
+            # The per-part cap alone bounded one slide, not the deck: 40 slides
+            # of 8 MB each fit in a 0.3 MB attachment and took 95 seconds to
+            # parse, and at the 10 MB attachment limit that is past the
+            # watchdog. Declared sizes are safe to budget on - zipfile never
+            # inflates a member past the size it declares.
+            xml_bytes = sum(i.file_size for i in zf.infolist()
+                            if i.filename.endswith((".xml", ".rels")))
+            if xml_bytes > OFFICE_MAX_TOTAL or len(names) > OFFICE_MAX_MEMBERS:
+                raise ValueError("%.1f MB of XML in %d parts - too much to read"
+                                 % (xml_bytes / 1048576, len(names)))
             if "word/document.xml" in names:
                 kind, text = "Word document", _docx_text(zf)
             elif any(n.startswith("ppt/slides/slide") for n in names):
@@ -1071,8 +1160,13 @@ def sniff_type(data, ctype, filename):
     return ctype
 
 
-def extract_attachments(msg):
-    """Return (content blocks Claude can read, names of ones it can't)."""
+def extract_attachments(msg, open_documents=True):
+    """Return (content blocks Claude can read, names of ones it can't).
+
+    open_documents=False lists Office files without unzipping them. Used for a
+    sender without file permission, whose message is declined unread anyway -
+    parsing their attachment first meant anyone allowed to send text could
+    still make the bot chew through a crafted archive."""
     blocks, unreadable, total = [], [], 0
     # A single-part message can still BE an attachment - scan-to-email from a
     # copier arrives as a bare application/pdf with no multipart wrapper. It
@@ -1155,6 +1249,9 @@ def extract_attachments(msg):
             blocks.append({"type": "text",
                            "text": "Attached file %s:\n%s" % (name, text)})
             total += len(text)
+        elif not open_documents:
+            unreadable.append("%s (not opened)" % name)
+            continue
         else:
             try:
                 kind, text = office_text(data)
@@ -2243,6 +2340,43 @@ def typed_intent(own_text, field):
     return bool(re.search(SETTING_SIGNALS[field], own_text or "", re.I))
 
 
+# What an admin must have typed for a particular model or effort level to be
+# the one applied - not merely a word near the topic.
+MODEL_WORDS = {"claude-opus-5": r"opus", "claude-sonnet-5": r"sonnet",
+               "claude-haiku-4-5": r"haiku", "claude-fable-5": r"fable"}
+EFFORT_WORDS = {"low": r"low|less\s+hard|least",
+                "medium": r"medium|moderate",
+                "high": r"high",
+                "xhigh": r"x-?high|extra[\s-]+high",
+                "max": r"max|maximum|as\s+hard\s+as|hardest"}
+
+
+def typed_value(own_text, field, value):
+    """Is this specific new value visible in what the admin typed?
+
+    typed_intent alone was too generous for the fields with no address in
+    them: "thanks, I'll reply to them myself" contains "reply", and that let a
+    style lifted from a stranger's words - quoted back in one of our alerts -
+    be applied to every sender's prompt. Now the value itself has to come from
+    the admin. A model or effort level has to be named; a style has to be
+    mostly in their own words (the prompt asks the model to copy them)."""
+    text = (own_text or "").lower()
+    if not text.strip() or value is None:
+        return False
+    if field == "model":
+        word = MODEL_WORDS.get(str(value))
+        return bool(word and re.search(r"\b(%s)\b" % word, text))
+    if field == "effort":
+        word = EFFORT_WORDS.get(str(value))
+        return bool(word and re.search(r"\b(%s)\b" % word, text))
+    if field == "style":
+        words = re.findall(r"[^\W\d_]{4,}", str(value).lower())
+        if not words or not typed_intent(own_text, "style"):
+            return False
+        return sum(1 for w in words if w in text) >= 0.6 * len(words)
+    return False
+
+
 # Words that suggest a settings change or a report, rather than an ordinary
 # question. Only used to decide which system prompt to send.
 ADMIN_REPORT_WORDS = re.compile(
@@ -2320,7 +2454,8 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
               'someone, "memory_for": [emails] if they asked what is remembered '
               'about someone, '
               'else [] for everyone, '
-              '"style": string or null, '
+              '"style": the new reply style in the admin\'s OWN words from their '
+              'latest message, copied rather than paraphrased, or null, '
               '"model": one of claude-opus-5, claude-sonnet-5, claude-haiku-4-5, '
               'claude-fable-5, or null if no model change was asked for, '
               '"opus_add": [emails] if they asked to let someone use the top '
@@ -2383,7 +2518,7 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
     # deliberately generous, and anything blocked is reported back so it can
     # simply be said again.
     for field in ("style", "model", "effort"):
-        if parsed.get(field) and not typed_intent(own_text, field):
+        if parsed.get(field) and not typed_value(own_text, field, parsed[field]):
             blocked.append("%s (%s)" % (field, field))
             parsed[field] = None
     for addr in parsed.get("add") or []:
@@ -2859,6 +2994,60 @@ def classify_outsider(state, sender, subject, body):
 
 
 OUTSIDER_MEMORY_DAYS = float(os.environ.get("OUTSIDER_MEMORY_DAYS", "7"))
+# Strangers pay for their own triage out of this, not out of the daily spend
+# cap. Each new address costs a call, and addresses cost nothing to invent -
+# before this, a stranger rotating them could spend the whole cap by lunchtime
+# and every allowlisted person's mail was held until midnight. Past the budget
+# they are still flagged, just without being read by the model.
+TRIAGE_DAILY_MAX = int(os.environ.get("TRIAGE_DAILY_MAX", "40"))
+# Flag alerts are real sends and count against the reply caps. Without a limit
+# of their own, one stranger mailing every few minutes produced an alert per
+# pass and used up the hourly cap that everybody's replies depend on. Over
+# this, flags wait and go out together in a later alert - never dropped.
+FLAG_ALERTS_PER_HOUR = int(os.environ.get("FLAG_ALERTS_PER_HOUR", "4"))
+
+
+def triage_budget_left(state):
+    """Take one triage call from today's budget; False if it is spent."""
+    if TRIAGE_DAILY_MAX <= 0:
+        return True
+    day = now_utc().strftime("%Y-%m-%d")
+    rec = state.get("triage_day") or {}
+    if rec.get("day") != day:
+        rec = {"day": day, "n": 0}
+    if rec["n"] >= TRIAGE_DAILY_MAX:
+        state["triage_day"] = rec
+        return False
+    rec["n"] += 1
+    state["triage_day"] = rec
+    return True
+
+
+def deliver_flags(state, flagged):
+    """Send flag alerts, holding them over when the alert rate is used up.
+
+    Returns True if the state changed and needs saving."""
+    pending = list(state.get("pending_flags") or []) + list(flagged or [])
+    if not pending:
+        return False
+    now = time.time()
+    recent = [t for t in state.get("flag_alert_times", []) if now - t < 3600]
+    if FLAG_ALERTS_PER_HOUR > 0 and len(recent) >= FLAG_ALERTS_PER_HOUR:
+        state["pending_flags"] = pending[-MAX_HELD:]
+        state["flag_alert_times"] = recent
+        log.info("%d flag(s) held - %d alerts already sent this hour",
+                 len(pending), len(recent))
+        return True
+    try:
+        for _ in range(send_flag_alerts(pending) or 0):
+            record_send(state)
+            recent.append(now)
+        state["pending_flags"] = []
+    except Exception as exc:
+        log.error("flag alert failed: %s", exc)
+        state["pending_flags"] = pending[-MAX_HELD:]
+    state["flag_alert_times"] = recent
+    return True
 
 
 def remembered_verdict(state, addr):
@@ -3094,6 +3283,9 @@ def process_unseen(server, state):
         log.error("search failed: %s", exc)
         return
     if not uids:
+        # Flags held back by the alert rate still go out on a quiet mailbox.
+        if state.get("pending_flags") and deliver_flags(state, []):
+            save_state(state)
         return
 
     if len(uids) > MAX_BATCH:
@@ -3164,29 +3356,44 @@ def process_unseen(server, state):
             if WATCHDOG_KICK:
                 WATCHDOG_KICK()
 
-            # A From address is trivially forged, and an admin one is the most
-            # valuable thing to forge here - it turns any stranger into someone
-            # who can change the model, the reply style and the allowlist. If
-            # the receiving server says the sending domain did NOT check out,
-            # the claim of admin is refused outright. A missing header is not a
-            # failure; only an explicit one is.
-            if is_admin(sender) and authentication_ok(msg) is False:
-                log.error("REFUSED mail claiming to be from the admin %s - the "
-                          "server says its domain did not authenticate", sender)
+            # A From address is trivially forged. An admin one turns a stranger
+            # into someone who can rewrite the allowlist, the model and the
+            # style every other sender's prompt is built from; an allowlisted
+            # one gets the bot to write, at the forger's direction, to a person
+            # who trusts this address, on their quota and our bill. So:
+            #   admins    - must be positively verified (fail closed)
+            #   allowlist - refused when our server checked and nothing vouched
+            #               for the From domain
+            # Strangers are never answered, so there is nothing to protect.
+            verified = authentication_ok(msg, sender)
+            admin_claim = is_admin(sender)
+            forged = verified is False or (
+                admin_claim and verified is None and not ALLOW_UNVERIFIED_ADMIN)
+            if forged and (admin_claim or in_list(sender, state["allowlist"])):
+                who = "your admin address" if admin_claim else "an allowlisted address"
+                why = ("our mail server's SPF/DKIM/DMARC results do not vouch for "
+                       "the sending domain, so the From address was probably forged"
+                       if verified is False else
+                       "there is no Authentication-Results header from our mail "
+                       "server, so it could not be verified - admin mail has to be")
+                log.error("REFUSED mail claiming to be from %s (%s) - %s",
+                          sender, who, why)
                 flagged.append({
                     "sender": msg.get("From", sender),
                     "addr": sender,
                     "subject": subject,
                     "date": received.isoformat() if received else "unknown",
-                    "summary": "a message claiming to be from your admin address "
-                               "failed sender authentication and was not acted on",
+                    "summary": "a message claiming to be from %s failed sender "
+                               "authentication and was not read or answered" % who,
                     "quote": "",
-                    "reason": "SPF/DKIM/DMARC said the sending domain did not "
-                              "check out, so the From address was probably forged",
-                    "resolve": "if you did send this, resend it from the account "
-                               "itself rather than through anything that rewrites "
-                               "the sender. Otherwise someone tried to impersonate "
-                               "you - nothing was changed and nothing was answered.",
+                    "reason": why,
+                    "resolve": "if it was genuine, it was probably relayed through "
+                               "something that rewrites mail (a forwarding rule, a "
+                               "mailing list) - send from the account itself. "
+                               "Otherwise someone tried to impersonate them; "
+                               "nothing was changed and nothing was sent. If EVERY "
+                               "admin message is refused this way, check AUTHSERV_ID "
+                               "in the compose file.",
                 })
                 label(server, uid, LABEL_DENIED)
                 mark_seen(server, uid)
@@ -3216,6 +3423,14 @@ def process_unseen(server, state):
                                "summary": "not triaged - the daily spend cap had "
                                           "been reached, so this was flagged "
                                           "without being read by the model"}
+                elif not triage_budget_left(state):
+                    log.warning("today's triage budget (%d) is spent - flagging "
+                                "%s without triaging it", TRIAGE_DAILY_MAX, sender)
+                    verdict = {"flag": "red", "quote": "",
+                               "summary": "not triaged - more strangers than "
+                                          "usual wrote in today (TRIAGE_DAILY_MAX "
+                                          "reached), so this was flagged without "
+                                          "being read by the model"}
                 else:
                     verdict = classify_outsider(state, sender, subject, body) or {}
                 # Triage is billed like anything else, so it has to be recorded
@@ -3253,13 +3468,15 @@ def process_unseen(server, state):
             # Work out what this message actually carries before deciding it is
             # empty: the question is often in the subject, or the whole point is
             # an attached photo with no body text at all.
-            attachments, unreadable = extract_attachments(msg)
+            # Sending files is a separate permission from being answered at all,
+            # and it is decided before any archive is opened.
+            may_send_files = in_list(
+                sender, state.get("file_allowlist", DEFAULT_FILE_ALLOWLIST))
+            attachments, unreadable = extract_attachments(
+                msg, open_documents=may_send_files)
             has_subject = subject.strip().lower() not in EMPTY_SUBJECTS
             sent_anything = bool(attachments or unreadable)
-
-            # Sending files is a separate permission from being answered at all.
-            files_refused = sent_anything and not in_list(
-                sender, state.get("file_allowlist", DEFAULT_FILE_ALLOWLIST))
+            files_refused = sent_anything and not may_send_files
 
             if not own_text and not sent_anything and not has_subject:
                 log.info("skipped %s - empty message: no new text, no subject, "
@@ -3701,12 +3918,8 @@ def process_unseen(server, state):
         dirty = True
 
     try:
-        if flagged:
-            try:
-                for _ in range(send_flag_alerts(flagged) or 0):
-                    record_send(state)
-            except Exception as exc:
-                log.error("flag alert failed: %s", exc)
+        if deliver_flags(state, flagged):
+            dirty = True
     finally:
         if dirty:
             save_state(state)
@@ -3794,6 +4007,16 @@ def main():
         log.error("an account gets locked out.")
         log.error("=" * 70)
         sys.exit(1)
+
+    if AUTHSERV_ID:
+        log.info("sender authentication: trusting only Authentication-Results "
+                 "from %s", AUTHSERV_ID)
+    else:
+        log.info("sender authentication: trusting the topmost Authentication-"
+                 "Results header (set AUTHSERV_ID to pin it to your provider)")
+    if ALLOW_UNVERIFIED_ADMIN:
+        log.warning("ALLOW_UNVERIFIED_ADMIN is on - admin mail with no "
+                    "authentication result is trusted, so a forged From: works")
 
     state = load_state()
     now = time.time()

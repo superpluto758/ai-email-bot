@@ -54,6 +54,24 @@ services:
       # for machine reports such as DMARC aggregates.
       IGNORE_SENDERS: "noreply-dmarc-support@google.com"
 
+      # ---- sender authentication ------------------------------------------
+      # Admin mail is acted on only if YOUR mail server verified it (an aligned
+      # SPF/DKIM/DMARC pass), and allowlisted mail is refused when the server
+      # checked and nothing vouched for it. Set this to the name your provider
+      # writes at the start of its Authentication-Results header - open any
+      # received mail's source and copy the part before the first ";" (e.g.
+      # "mx.fastmail.com", or "mx.zohomail.eu" for Zoho EU). Empty trusts the topmost header, which is fine as
+      # long as your provider always adds one.
+      AUTHSERV_ID: ""
+      # Only if your provider adds NO Authentication-Results header at all and
+      # every admin email is being refused. Re-opens admin impersonation.
+      ALLOW_UNVERIFIED_ADMIN: "0"
+      # Strangers are triaged by the model at most this many times a day; the
+      # rest are still flagged, just unread. Keeps them off the spend cap.
+      TRIAGE_DAILY_MAX: "40"
+      # Flag alerts sent per hour. Extra flags wait for the next alert.
+      FLAG_ALERTS_PER_HOUR: "4"
+
       # ---- behaviour (optional) -------------------------------------------
       # Sets the From: display name AND the name it introduces itself with
       FROM_NAME: "AI Assistant"

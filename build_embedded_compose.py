@@ -22,7 +22,10 @@ COMPOSE = HERE / "docker-compose.yml"
 
 
 def main():
-    payload = base64.b64encode(gzip.compress(SOURCE.read_bytes(), 9)).decode()
+    # A Windows checkout has CRLF endings; ship what git holds, so the build id
+    # the bot reports matches the committed file.
+    source = SOURCE.read_bytes().replace(b"\r\n", b"\n")
+    payload = base64.b64encode(gzip.compress(source, 9)).decode()
     wrapped = "\n".join("        " + payload[i:i + 100]
                         for i in range(0, len(payload), 100))
 
@@ -32,7 +35,9 @@ def main():
         if line.strip() == "- ./bot.py:/app/bot.py:ro":
             continue
         # Replace the startup command with one that unpacks the payload
-        if line.strip() == "pip install --quiet --no-cache-dir imapclient":
+        # Matched loosely: an exact match stopped matching the day imapclient
+        # was pinned, and the output then ran a bot.py it never wrote.
+        if line.strip().startswith("pip install") and "imapclient" in line:
             out.append("        mkdir -p /app /data")
             out.append("        printf '%s' \"$$BOT_B64\" | tr -d '\\n' "
                        "| base64 -d | gunzip > /app/bot.py")

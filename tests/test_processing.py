@@ -55,6 +55,10 @@ ok("long derived subject trimmed", len(b.reply_subject("", "x "*90)) < 70)
 
 # ------------------------------------------------------------- full pipeline
 section("end-to-end message handling")
+# What our own mail server stamps on genuine admin mail. Admin mail without it
+# is refused, so a real admin message in these tests has to carry it.
+VERIFIED = "mx.example.com; dkim=pass header.d=example.com; dmarc=pass header.from=example.com"
+
 def msg(frm, subj, body, mid, attach=False, **h):
     m = email.message.EmailMessage()
     m["From"], m["Subject"], m["Message-ID"] = frm, subj, mid
@@ -113,7 +117,8 @@ srv,st,sent = run({14: msg(USER,"look","see this","<e@x>",attach=True)})
 ok("file without permission declined", sent and "declin" in sent[0][2].lower())
 ok("decline raises a flag", any("[AI Flag]" in s for _,s,_ in sent))
 
-srv,st,sent = run({15: msg(ADMIN,"look","see this","<f@x>",attach=True)},
+srv,st,sent = run({15: msg(ADMIN,"look","see this","<f@x>",attach=True,
+                      Authentication_Results=VERIFIED)},
                   reply="Nice picture.")
 ok("admin may send files", sent and sent[0][0]==[ADMIN])
 
@@ -143,7 +148,8 @@ finally:
     b.call_claude = _real
 
 # Owners must still be able to ask - they are the people who need the answer.
-srv,st,sent = run({22: msg(ADMIN,"hi","who is the admin here?","<i@x>")},
+srv,st,sent = run({22: msg(ADMIN,"hi","who is the admin here?","<i@x>",
+                      Authentication_Results=VERIFIED)},
                   reply="You and two others.")
 ok("an owner asking is answered", any(to==[ADMIN] for to,_,_ in sent))
 
