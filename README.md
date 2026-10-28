@@ -219,7 +219,7 @@ depends on how you phrased it:
 ```
 SYSTEM
   Mailbox:          you@example.com
-  Model:            claude-opus-5   (simple questions -> claude-sonnet-5)
+  Model:            claude-opus-5-5   (simple questions -> claude-sonnet-5-5)
   Recording since:  2026-08-12  (16.4 days across 7 starts)
   Clock:            UTC   (spend cap and report dates roll at 00:00 UTC;
                        the send caps above are rolling 24h windows)
@@ -371,22 +371,23 @@ tier to `""` to switch it off.
 ### Reasoning effort
 
 Owners get more thinking depth than the people writing in, since they are the
-ones asking the hard questions. This is `output_config.effort`, where `high` is
-the API default — an omitted value is not "no thinking":
+ones asking the hard questions. This is `output_config.effort`, where the API
+default is `high` on Sonnet and Fable and `medium` on Opus 5.5 and Haiku 5.5 —
+an omitted value is not "no thinking":
 
 | | Effort |
 |---|---|
 | Owner, main model Opus | `xhigh` |
 | Owner, main model Sonnet | `max` |
 | Owner, main model Fable | `xhigh` |
-| Everyone else | the default (`high`) |
+| Everyone else | the default (`high` on Sonnet and Fable, `medium` on Opus 5.5 and Haiku 5.5) |
 
 An owner can override it for themselves with `use max effort` (or `low`,
 `medium`, `high`, `xhigh`). Only those five levels are accepted; anything else
 is ignored rather than sent.
 
-Haiku rejects the parameter outright, so it is never sent on that model —
-including when an override is set.
+Haiku 4.5 rejected the parameter outright, so it was never sent on that model.
+Haiku 5.5 accepts it, so it is sent there like anywhere else.
 
 ### Who gets flagged
 
@@ -553,7 +554,7 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `NEVER_UNPROMPTED_ADDRESSES` | | Admins who are never emailed unless they wrote first |
 | `IGNORE_SENDERS` | | Senders left completely alone — never read, answered or counted |
 | `FROM_NAME` | | Display name on replies |
-| `MODEL` | | Main model. Default `claude-opus-5` |
+| `MODEL` | | Main model. Default `claude-opus-5-5` |
 | `TRIVIAL_MODEL` / `TRIVIAL_MAX_CHARS` | | Cheapest tier for very short questions |
 | `SIMPLE_MODEL` / `SIMPLE_MAX_CHARS` | | Middle tier for short questions |
 | `MAX_SENDS_PER_HOUR` / `MAX_SENDS_PER_DAY` | | Send caps |
@@ -564,7 +565,7 @@ Everything is set through environment variables in `docker-compose.yml`.
 | `MEMORY_NOTE_MAX_CHARS` | | Longest single stored note, default 200 |
 | `DAILY_SPEND_CAP_USD` | | Daily API spend backstop, default 10. Mail is held, not lost; admins exempt; `0` disables |
 | `API_RETRIES` / `MAX_TRANSIENT_HOLDS` | | How a rate limit or an outage is ridden out rather than blamed on the message |
-| `TRIAGE_MODEL` | | Model that triages strangers, default `claude-sonnet-5`. Empty = the main model |
+| `TRIAGE_MODEL` | | Model that triages strangers, default `claude-sonnet-5-5`. Empty = the main model |
 | `OUTSIDER_MEMORY_DAYS` | | How long a stranger's flag is remembered, default 7. Only "red" is cached |
 | `TRIVIAL_WEB_SEARCH` | | Buy web search on the cheapest tier too. Off by default |
 | `QUOTED_CONTEXT_CHARS` | | How much quoted thread history to send, default 1200; `0` sends it all |
@@ -773,6 +774,10 @@ opus-5     cache_write 1803 -> cache_read 1803   caching
 sonnet-5   cache_write 1804 -> cache_read 1804   caching
 haiku-4-5  cache_write 0    -> cache_read 0      ignored
 ```
+
+Those figures are for the previous generation. Opus 5.5, Sonnet 5.5 and Haiku
+5.5 — the models now configured — are all documented at a 512-token minimum, so
+the trivial tier is expected to cache too; re-run `live_probe.py` to confirm.
 
 `live_probe.py` sends the bot's exact request shapes to the real API and prints
 the above, along with which models accept `output_config.effort` and which

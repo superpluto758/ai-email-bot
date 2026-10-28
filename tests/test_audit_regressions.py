@@ -98,7 +98,7 @@ class Srv:
     def add_flags(s,*a): pass
     def remove_flags(s,*a): pass
 srv=Srv({7:mk("<a@x>")}); b.detect_label_mode(srv)
-st=b.load_state(); st["last_uid"]=0; st["seen_ids"]=[]; st["model"]="claude-opus-5"
+st=b.load_state(); st["last_uid"]=0; st["seen_ids"]=[]; st["model"]="claude-opus-5-5"
 sent=[]; b.save_state=lambda s:None; b.human_pause=lambda:None; b.mark_seen=lambda *a:None
 b.send_mail=lambda to,s_,body,**k: sent.append(to) or True
 n=[0]
@@ -154,7 +154,7 @@ for s_,want in [("Auto insurance renewal - a good deal?",False),("Out of office 
 
 sec("medium: the top-model permission is never a downgrade")
 st=b.load_state(); st["opus_allowlist"]=["vip@example.com"]
-for main in ("claude-opus-5","claude-haiku-4-5"):
+for main in ("claude-opus-5-5","claude-haiku-5-5"):
     st["model"]=main
     ordinary=b.pick_model(st,"x"*400,None,"other@example.com")
     vip=b.pick_model(st,"x"*400,None,"vip@example.com")
@@ -163,7 +163,7 @@ for main in ("claude-opus-5","claude-haiku-4-5"):
 
 sec("medium: every billed call is recorded")
 st=b.load_state(); st["spend"]={}; st["by_user"]={}
-b.LAST_CALL.clear(); b.LAST_CALL.update({"model":"claude-opus-5",
+b.LAST_CALL.clear(); b.LAST_CALL.update({"model":"claude-opus-5-5",
     "usage":{"input_tokens":1000,"output_tokens":100},"searches":1})
 b.record_last_call(st,"stranger@example.com")
 mth=time.strftime("%Y-%m")
@@ -177,7 +177,7 @@ st["by_user"]={"2026-07":{"a@x.com":{"msgs_in":9,"msgs_out":9,"in":900000,"out":
 st["usage_names"]={"a@x.com":"a@x.com"}
 ok("monthly reports the month it closes", "2026-07" in b.full_analytics(st, month="2026-07")
    and "a@x.com" in b.full_analytics(st, month="2026-07"))
-ok("fable priced correctly", b.PRICES["claude-fable-5"]==(10.0,50.0))
+ok("fable priced correctly", b.PRICES["claude-fable-5-1"]==(10.0,50.0))
 
 sec("medium: header encodings")
 def hdr(sb): return b.header(email.message_from_bytes(b"From: a@x.com\r\nSubject: "+sb+b"\r\n\r\nx\r\n"),"Subject")
@@ -192,7 +192,7 @@ class R:
     def read(s): return json.dumps({"content":[],"stop_reason":"end_turn","usage":{}}).encode()
 b.urllib.request.urlopen=lambda req,timeout=None: R()
 b.call_claude = REAL_CALL_CLAUDE
-out=b.call_claude("claude-sonnet-5","s","hi")
+out=b.call_claude("claude-sonnet-5-5","s","hi")
 ok("returns text, not None", out is not None and "wasn't able" in out)
 
 sec("critical: a decline is never silent")
@@ -305,11 +305,11 @@ b.call_claude = REAL_CALL_CLAUDE
 # away from the code-execution caller we never use.
 # haiku-4-5 was on the old tool until the live probe showed it runs the new
 # one (searches=1, real result blocks). Verified, not assumed.
-_EXPECT = {"claude-haiku-4-5": ("web_search_20260209", ["direct"]),
+_EXPECT = {"claude-haiku-5-5": ("web_search_20260209", ["direct"]),
            "claude-haiku-3-5": ("web_search_20250305", None),
-           "claude-sonnet-5":  ("web_search_20260209", ["direct"]),
-           "claude-opus-5":    ("web_search_20260209", ["direct"]),
-           "claude-fable-5":   ("web_search_20260209", ["direct"])}
+           "claude-sonnet-5-5":  ("web_search_20260209", ["direct"]),
+           "claude-opus-5-5":    ("web_search_20260209", ["direct"]),
+           "claude-fable-5-1":   ("web_search_20260209", ["direct"])}
 for _m, (_type, _callers) in sorted(_EXPECT.items()):
     _cap.clear(); b.call_claude(_m,"sys","hi",web_search=True)
     _t=_cap[0]["tools"][0]

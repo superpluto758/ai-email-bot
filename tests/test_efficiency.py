@@ -74,7 +74,7 @@ CAP[:] = []; api('{"flag":"red","summary":"s","quote":""}')
 b.classify_outsider(fresh(), "x@y.com", "s", "body")
 ok("triage uses TRIAGE_MODEL", CAP[-1]["model"] == b.TRIAGE_MODEL, CAP[-1]["model"])
 ok("TRIAGE_MODEL defaults to the cheap tier",
-   b.TRIAGE_MODEL == "claude-sonnet-5", b.TRIAGE_MODEL)
+   b.TRIAGE_MODEL == "claude-sonnet-5-5", b.TRIAGE_MODEL)
 # The safety property must not depend on which model runs it.
 api('{"flag":"orange"}')                       # orange with no evidence
 ok("unjustified orange still becomes red",

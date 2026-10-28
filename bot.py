@@ -105,25 +105,28 @@ DEFAULT_FILE_ALLOWLIST = _addresses("FILE_ALLOWLIST") or list(ADMINS)
 
 DEFAULT_STYLE = ("clear, helpful and direct; as long as needed to fully answer; "
                  "match the language of the prompt")
-DEFAULT_MODEL = os.environ.get("MODEL", "claude-opus-5")
+DEFAULT_MODEL = os.environ.get("MODEL", "claude-opus-5-5")
 # Every model an admin is allowed to switch to by email.
-ALLOWED_MODELS = {"claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5",
-                  "claude-fable-5"}
+ALLOWED_MODELS = {"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+                  "claude-fable-5-1"}
 # Models automatic routing must never pick on its own - an admin has to ask
 # for them by name.
-NEVER_AUTO_ROUTE = {"claude-fable-5"}
+NEVER_AUTO_ROUTE = {"claude-fable-5-1"}
 
-# Reasoning effort (output_config.effort). "high" is the API default, so an
-# omitted value is not "no thinking" - it is high. Owners get more depth than
-# the people writing in, because they are the ones asking the hard questions.
+# Reasoning effort (output_config.effort). The API default is "high" on Sonnet
+# and Fable and "medium" on Opus 5.5 and Haiku 5.5, so an omitted value is not
+# "no thinking" - it is that default. Owners get more depth than the people
+# writing in, because they are the ones asking the hard questions.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 ADMIN_EFFORT = {
-    "claude-opus-5":   "xhigh",
-    "claude-sonnet-5": "max",
-    "claude-fable-5":  "xhigh",
+    "claude-opus-5-5":   "xhigh",
+    "claude-sonnet-5-5": "max",
+    "claude-fable-5-1":  "xhigh",
 }
-# Haiku 4.5 rejects output_config.effort outright, so it must never be sent.
-NO_EFFORT_MODELS = {"claude-haiku-4-5"}
+# Haiku 4.5 rejected output_config.effort outright, so it was never sent there.
+# Haiku 5.5 accepts it (low to max, default medium), so nothing is excluded
+# now; the set stays for any model that turns out to reject the parameter.
+NO_EFFORT_MODELS = set()
 
 # Policy outcomes where nothing was actually answered. These get the red tag,
 # not the green one: the sender was turned down, not helped.
@@ -145,10 +148,11 @@ API_URL = "https://api.anthropic.com/v1/messages"
 # web_search_tool_result blocks come back, searches=1). It was excluded here
 # on the documented release order alone, which cost it the newer tool's
 # dynamic filtering for no reason. Anything genuinely older still gets the
-# _20250305 tool.
+# _20250305 tool. haiku-5-5 is listed on that basis - its predecessor runs the
+# newer tool - and live_probe.py section [6] is the check that it does too.
 WEB_SEARCH_NEW_MODELS = ("opus-5", "opus-4-8", "opus-4-7", "opus-4-6",
                          "sonnet-5", "sonnet-4-6", "fable-5", "mythos-5",
-                         "haiku-4-5")
+                         "haiku-5-5", "haiku-4-5")
 # HTTP codes meaning "the API is having a moment", not "this message is bad".
 TRANSIENT_CODES = (408, 409, 425, 429, 500, 502, 503, 504, 529)
 API_RETRIES = int(os.environ.get("API_RETRIES", "2"))
@@ -849,24 +853,24 @@ YEARLY_REPORT = os.environ.get("YEARLY_REPORT", "1") not in ("0", "false", "no")
 
 # Simple questions can go to a cheaper model. Set to "" to always use the main
 # model. Routing is a cheap heuristic, not another API call.
-SIMPLE_MODEL = os.environ.get("SIMPLE_MODEL", "claude-sonnet-5")
+SIMPLE_MODEL = os.environ.get("SIMPLE_MODEL", "claude-sonnet-5-5")
 SIMPLE_MAX_CHARS = int(os.environ.get("SIMPLE_MAX_CHARS", "350"))
 # Which model triages strangers. Empty means "whatever the main model is" -
 # the safe default, because judging a real person to be a machine is the one
-# mistake this must never make. Set it to claude-sonnet-5 to cut the cost of
+# mistake this must never make. Set it to claude-sonnet-5-5 to cut the cost of
 # every stranger who writes in.
 # Triage runs on the cheap tier by default: a stranger who is not on the
 # allowlist is never answered either way, so this call only decides whether the
 # owner is told. The safety property - anything unparseable, unjustified or
 # failed becomes "red" - is enforced in code below, not by the model, so it
 # holds whichever model runs it. Set it to the main model if you would rather.
-TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-5").strip()
+TRIAGE_MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-5-5").strip()
 # A search costs about as much as the whole cheap-tier call it sits in, and a
 # question short enough to reach that tier is almost never about a live fact.
 # Anything that might be escalates out of the tier first (see pick_model).
 # Set to 1 if you would rather pay for the certainty.
 TRIVIAL_WEB_SEARCH = os.environ.get("TRIVIAL_WEB_SEARCH", "0") not in ("0", "false", "no")
-TRIVIAL_MODEL = os.environ.get("TRIVIAL_MODEL", "claude-haiku-4-5")
+TRIVIAL_MODEL = os.environ.get("TRIVIAL_MODEL", "claude-haiku-5-5")
 TRIVIAL_MAX_CHARS = int(os.environ.get("TRIVIAL_MAX_CHARS", "60"))
 
 # Remembering people between conversations. Notes are written by the model as
@@ -880,10 +884,18 @@ MEMORY_NOTE_MAX_CHARS = int(os.environ.get("MEMORY_NOTE_MAX_CHARS", "200"))
 
 # USD per million tokens, for the spend report. Update if pricing changes.
 PRICES = {
-    "claude-fable-5":  (10.0, 50.0),
-    "claude-opus-5":   (5.0, 25.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-fable-5-1":  (10.0, 50.0),
+    "claude-opus-5-5":   (4.0, 20.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    # Haiku 5.5 has a second rate card (0.50 / 2.50) for prompts over 100K
+    # tokens; an email never gets near that, so the lower card is used.
+    "claude-haiku-5-5":  (0.10, 0.50),
+    # Previous generation, so a state file that still names one of these is
+    # billed at its own rate until an admin switches model by email.
+    "claude-fable-5":    (10.0, 50.0),
+    "claude-opus-5":     (5.0, 25.0),
+    "claude-sonnet-5":   (2.0, 10.0),
+    "claude-haiku-4-5":  (1.0, 5.0),
 }
 WEB_SEARCH_USD = 0.01          # per search
 
@@ -1419,6 +1431,9 @@ def call_claude(model, system, user_content, max_tokens=6000, web_search=False,
     # the API neither errors nor warns - it just bills full price. So on the
     # trivial tier this is a harmless no-op, not a saving, and padding the
     # prompt to reach the minimum would cost more than it saved.
+    # Haiku 5.5, the current trivial tier, is documented at a 512-token minimum
+    # like Opus 5.5 and Sonnet 5.5, so it should cache too - live_probe.py
+    # section [5] is the measurement.
     payload = {
         "model": model,
         "max_tokens": max_tokens,
@@ -1698,7 +1713,7 @@ def record_spend(state, model, usage, searches=0, sender=None):
         week, {"in": 0, "out": 0, "searches": 0, "usd": 0.0})
     tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
     tout = usage.get("output_tokens", 0)
-    rate_in, rate_out = PRICES.get(model, PRICES["claude-opus-5"])
+    rate_in, rate_out = PRICES.get(model, PRICES["claude-opus-5-5"])
     bucket["in"] += tin
     bucket["out"] += tout
     bucket["searches"] += searches
@@ -2029,8 +2044,8 @@ def add_memory(state, addr, note):
 
 
 # Rough capability order, used only to stop a permission becoming a downgrade.
-MODEL_RANK = {"claude-haiku-4-5": 1, "claude-sonnet-5": 2,
-              "claude-opus-5": 3, "claude-fable-5": 4}
+MODEL_RANK = {"claude-haiku-5-5": 1, "claude-sonnet-5-5": 2,
+              "claude-opus-5-5": 3, "claude-fable-5-1": 4}
 
 
 def better_model(*models):
@@ -2342,8 +2357,8 @@ def typed_intent(own_text, field):
 
 # What an admin must have typed for a particular model or effort level to be
 # the one applied - not merely a word near the topic.
-MODEL_WORDS = {"claude-opus-5": r"opus", "claude-sonnet-5": r"sonnet",
-               "claude-haiku-4-5": r"haiku", "claude-fable-5": r"fable"}
+MODEL_WORDS = {"claude-opus-5-5": r"opus", "claude-sonnet-5-5": r"sonnet",
+               "claude-haiku-5-5": r"haiku", "claude-fable-5-1": r"fable"}
 EFFORT_WORDS = {"low": r"low|less\s+hard|least",
                 "medium": r"medium|moderate",
                 "high": r"high",
@@ -2423,8 +2438,8 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
               "(or to forget them), or ASKING FOR USAGE STATS (how many emails "
               "each user has sent - set usage_report true and do not invent "
               "numbers, the real table is appended for you), "
-              '("use opus" = claude-opus-5, "use sonnet" = claude-sonnet-5, '
-              '"use haiku" = claude-haiku-4-5, "use fable" = claude-fable-5). '
+              '("use opus" = claude-opus-5-5, "use sonnet" = claude-sonnet-5-5, '
+              '"use haiku" = claude-haiku-5-5, "use fable" = claude-fable-5-1). '
               "Any OTHER settings or action request (the admin list, forwarding, "
               "deleting, reading other mail, and so on) must be refused in the "
               "reply, noting it can only be changed in the bot's configuration. "
@@ -2456,8 +2471,8 @@ def handle_admin(state, thread_text, attachments=None, sender="", own_text=""):
               'else [] for everyone, '
               '"style": the new reply style in the admin\'s OWN words from their '
               'latest message, copied rather than paraphrased, or null, '
-              '"model": one of claude-opus-5, claude-sonnet-5, claude-haiku-4-5, '
-              'claude-fable-5, or null if no model change was asked for, '
+              '"model": one of claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5, '
+              'claude-fable-5-1, or null if no model change was asked for, '
               '"opus_add": [emails] if they asked to let someone use the top '
               'model - this also lets them email at all, so use it even if they '
               'are not on the main list yet, '
@@ -2752,7 +2767,7 @@ def classify_decline(question):
               "refusal": LAST_CALL.get("refusal"),
               "auth_error": LAST_CALL.get("auth_error")}
     try:
-        raw = call_claude(TRIVIAL_MODEL or "claude-haiku-4-5",
+        raw = call_claude(TRIVIAL_MODEL or "claude-haiku-5-5",
                           DECLINE_CATEGORY_PROMPT, question[:2000], max_tokens=300)
     except Exception as exc:
         log.warning("could not categorise a refusal: %s", exc)

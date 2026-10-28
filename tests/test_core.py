@@ -103,53 +103,53 @@ def fake(req, timeout=None):
 FAKE = [{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}}]
 b.urllib.request.urlopen = fake
 
-captured.clear(); b.call_claude("claude-opus-5","s","hi",effort="xhigh")
+captured.clear(); b.call_claude("claude-opus-5-5","s","hi",effort="xhigh")
 ok("effort sent on opus", captured[0].get("output_config") == {"effort":"xhigh"})
 ok("opus keeps refusal fallback", captured[0].get("fallbacks") == "default")
-captured.clear(); b.call_claude("claude-haiku-4-5","s","hi",effort="max")
-ok("effort NEVER sent to haiku", "output_config" not in captured[0])
-captured.clear(); b.call_claude("claude-sonnet-5","s","hi")
+captured.clear(); b.call_claude("claude-haiku-5-5","s","hi",effort="max")
+ok("effort sent to haiku 5.5 (4.5 rejected it)", captured[0].get("output_config") == {"effort":"max"})
+captured.clear(); b.call_claude("claude-sonnet-5-5","s","hi")
 ok("no deprecated params", not any(k in captured[0] for k in
     ("thinking","budget_tokens","temperature","top_p","output_format")))
-captured.clear(); b.call_claude("claude-sonnet-5","s","hi",web_search=True)
+captured.clear(); b.call_claude("claude-sonnet-5-5","s","hi",web_search=True)
 ok("web search tool is current", captured[0]["tools"][0]["type"] == "web_search_20260209")
 
 FAKE[0] = {"content":[{"type":"text","text":"see <cite>src</cite> here"}],"stop_reason":"end_turn","usage":{}}
-ok("cite tags stripped", "<cite>" not in b.call_claude("claude-sonnet-5","s","hi"))
+ok("cite tags stripped", "<cite>" not in b.call_claude("claude-sonnet-5-5","s","hi"))
 FAKE[0] = {"content":[{"type":"text","text":""}],"stop_reason":"refusal","usage":{}}
-ok("refusal handled gracefully", "can't help" in (b.call_claude("claude-sonnet-5","s","hi") or ""))
+ok("refusal handled gracefully", "can't help" in (b.call_claude("claude-sonnet-5-5","s","hi") or ""))
 FAKE[0] = {"content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn",
            "usage":{"input_tokens":100,"output_tokens":20,
                     "server_tool_use":{"web_search_requests":2}}}
-b.LAST_CALL.clear(); b.call_claude("claude-sonnet-5","s","hi")
+b.LAST_CALL.clear(); b.call_claude("claude-sonnet-5-5","s","hi")
 ok("usage recorded", b.LAST_CALL["usage"]["input_tokens"] == 100)
 ok("searches counted", b.LAST_CALL["searches"] == 2)
 
 # ------------------------------------------------------------------ routing
 section("routing")
-st = b.load_state(); st["model"] = "claude-opus-5"
+st = b.load_state(); st["model"] = "claude-opus-5-5"
 USER, VIP, ADMIN = "friend@example.com", "vip@example.com", b.ADMINS[0]
 st["opus_allowlist"] = [VIP]
-ok("user trivial -> haiku", b.pick_model(st,"what is 7x8?",None,USER) == "claude-haiku-4-5")
-ok("user long -> sonnet", b.pick_model(st,"x"*300,None,USER) == "claude-sonnet-5")
-ok("user very long capped at sonnet", b.pick_model(st,"x"*5000,None,USER) == "claude-sonnet-5")
-ok("user + photo capped at sonnet", b.pick_model(st,"what is this?",[1],USER) == "claude-sonnet-5")
-ok("user + news capped at sonnet", b.pick_model(st,"latest news?",None,USER) == "claude-sonnet-5")
-ok("vip + photo -> opus", b.pick_model(st,"what is this?",[1],VIP) == "claude-opus-5")
-ok("vip + news -> opus", b.pick_model(st,"latest news?",None,VIP) == "claude-opus-5")
-ok("vip trivial still haiku", b.pick_model(st,"hi",None,VIP) == "claude-haiku-4-5")
-ok("admin always main", b.pick_model(st,"hi",None,ADMIN,is_owner=True) == "claude-opus-5")
-ok("fable never auto-routed", "claude-fable-5" not in
+ok("user trivial -> haiku", b.pick_model(st,"what is 7x8?",None,USER) == "claude-haiku-5-5")
+ok("user long -> sonnet", b.pick_model(st,"x"*300,None,USER) == "claude-sonnet-5-5")
+ok("user very long capped at sonnet", b.pick_model(st,"x"*5000,None,USER) == "claude-sonnet-5-5")
+ok("user + photo capped at sonnet", b.pick_model(st,"what is this?",[1],USER) == "claude-sonnet-5-5")
+ok("user + news capped at sonnet", b.pick_model(st,"latest news?",None,USER) == "claude-sonnet-5-5")
+ok("vip + photo -> opus", b.pick_model(st,"what is this?",[1],VIP) == "claude-opus-5-5")
+ok("vip + news -> opus", b.pick_model(st,"latest news?",None,VIP) == "claude-opus-5-5")
+ok("vip trivial still haiku", b.pick_model(st,"hi",None,VIP) == "claude-haiku-5-5")
+ok("admin always main", b.pick_model(st,"hi",None,ADMIN,is_owner=True) == "claude-opus-5-5")
+ok("fable never auto-routed", "claude-fable-5-1" not in
    {b.pick_model(st,q,None,u) for q in ("hi","x"*300,"x"*5000) for u in (USER,VIP)})
 section("effort")
-ok("admin opus -> xhigh", b.pick_effort(st,"claude-opus-5",True) == "xhigh")
-ok("admin sonnet -> max", b.pick_effort(st,"claude-sonnet-5",True) == "max")
-ok("admin fable -> xhigh", b.pick_effort(st,"claude-fable-5",True) == "xhigh")
-ok("admin haiku -> none", b.pick_effort(st,"claude-haiku-4-5",True) is None)
-ok("user -> default", b.pick_effort(st,"claude-sonnet-5",False) is None)
+ok("admin opus -> xhigh", b.pick_effort(st,"claude-opus-5-5",True) == "xhigh")
+ok("admin sonnet -> max", b.pick_effort(st,"claude-sonnet-5-5",True) == "max")
+ok("admin fable -> xhigh", b.pick_effort(st,"claude-fable-5-1",True) == "xhigh")
+ok("admin haiku -> none", b.pick_effort(st,"claude-haiku-5-5",True) is None)
+ok("user -> default", b.pick_effort(st,"claude-sonnet-5-5",False) is None)
 st["effort"] = "max"
-ok("override honoured", b.pick_effort(st,"claude-opus-5",True) == "max")
-ok("override still not sent to haiku", b.pick_effort(st,"claude-haiku-4-5",True) is None)
+ok("override honoured", b.pick_effort(st,"claude-opus-5-5",True) == "max")
+ok("override honoured on haiku 5.5 too", b.pick_effort(st,"claude-haiku-5-5",True) == "max")
 st["effort"] = None
 
 # ------------------------------------------------------------------- limits
@@ -183,7 +183,7 @@ ok("dot variant shares memory", b.get_memory(st,"FRIEND@example.com") == b.get_m
 section("spend + analytics")
 st["spend"]={}; st["spend_week"]={}; st["by_user"]={}; st["usage"]={}; st["usage_names"]={}
 b.record_usage(st, USER)
-b.record_spend(st,"claude-sonnet-5",{"input_tokens":1_000_000,"output_tokens":100_000},3,USER)
+b.record_spend(st,"claude-sonnet-5-5",{"input_tokens":1_000_000,"output_tokens":100_000},3,USER)
 month = time.strftime("%Y-%m")
 exp = (1_000_000*2.0 + 100_000*10.0)/1_000_000 + 3*0.01
 ok("cost maths correct", abs(st["spend"][month]["usd"] - exp) < 1e-9,

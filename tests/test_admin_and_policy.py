@@ -19,7 +19,7 @@ def ok(n,c,d=""):
 def section(t): print("\n=== %s ==="%t)
 
 ADMIN, USER = b.ADMINS[0], "friend@example.com"
-st = b.load_state(); st["model"]="claude-opus-5"
+st = b.load_state(); st["model"]="claude-opus-5-5"
 sent=[]; b.send_mail = lambda to,s,body,**k: sent.append((list(to),s,body)) or True
 def admin(payload, text=None):
     """Simulate an admin email. `text` is what they typed; addresses only take
@@ -141,11 +141,11 @@ r = admin({"effort":"max","reply":"ok"})
 ok("effort set", st["effort"]=="max")
 r = admin({"effort":"ultracode","reply":"ok"})
 ok("invalid effort rejected", st["effort"]=="max")
-r = admin({"model":"claude-sonnet-5","reply":"ok"})
-ok("model switched", st["model"]=="claude-sonnet-5")
+r = admin({"model":"claude-sonnet-5-5","reply":"ok"})
+ok("model switched", st["model"]=="claude-sonnet-5-5")
 r = admin({"model":"gpt-4","reply":"ok"})
-ok("foreign model rejected", st["model"]=="claude-sonnet-5")
-st["model"]="claude-opus-5"
+ok("foreign model rejected", st["model"]=="claude-sonnet-5-5")
+st["model"]="claude-opus-5-5"
 r = admin({"style":"be terse","reply":"ok"})
 ok("style updated", st["style"]=="be terse")
 r = admin({"set_limits":{USER:5},"reply":"ok"})
@@ -160,7 +160,7 @@ ok("memory recalled in reply", "physics" in r)
 r = admin({"clear_memory":[USER],"reply":"ok"})
 ok("memory forgotten", not b.get_memory(st,USER))
 b.record_usage(st, USER)
-b.record_spend(st,"claude-sonnet-5",{"input_tokens":1000,"output_tokens":100},1,USER)
+b.record_spend(st,"claude-sonnet-5-5",{"input_tokens":1000,"output_tokens":100},1,USER)
 r = admin({"usage_report":True,"reply":"ok"})
 ok("usage table appended", "User" in r and "TOTAL" in r)
 r = admin({"spend_report":True,"reply":"ok"})

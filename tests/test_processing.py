@@ -80,7 +80,7 @@ class Srv:
 def run(msgs, reply='{"category":"normal","reply":"the answer"}', state=None):
     srv = Srv(msgs); b.detect_label_mode(srv)
     st = state or b.load_state()
-    st["last_uid"]=0; st["seen_ids"]=[]; st["model"]="claude-opus-5"
+    st["last_uid"]=0; st["seen_ids"]=[]; st["model"]="claude-opus-5-5"
     sent=[]
     b.save_state=lambda s:None; b.human_pause=lambda:None
     b.mark_seen=lambda s,u: srv.seen.append(u)

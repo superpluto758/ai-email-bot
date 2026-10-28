@@ -69,7 +69,7 @@ ok("ts_utc is aware too", b.ts_utc(0).tzinfo is not None)
 
 section("money is bucketed by the UTC day, not the host day")
 st = {"spend": {}, "spend_week": {}, "spend_day": {}, "by_user": {}}
-b.record_spend(st, "claude-sonnet-5", {"input_tokens": 1000, "output_tokens": 100})
+b.record_spend(st, "claude-sonnet-5-5", {"input_tokens": 1000, "output_tokens": 100})
 days = list(st["spend_day"])
 ok("exactly one day bucket", len(days) == 1, days)
 ok("day bucket is the UTC date", days[0] == UTC_DAY, "%s vs %s" % (days[0], UTC_DAY))
@@ -94,7 +94,7 @@ section("the spend cap reads the same key record_spend writes")
 # A mismatch here would not raise - the cap would just silently read 0.00 and
 # never fire. That is the whole reason this is a test and not a comment.
 st2 = {"spend": {}, "spend_week": {}, "spend_day": {}, "by_user": {}}
-b.record_spend(st2, "claude-opus-5", {"input_tokens": 2_000_000, "output_tokens": 0})
+b.record_spend(st2, "claude-opus-5-5", {"input_tokens": 3_000_000, "output_tokens": 0})
 ok("spend_today sees what was just recorded", b.spend_today(st2) > 0,
    b.spend_today(st2))
 ok("spend_today equals the day bucket",
@@ -157,7 +157,7 @@ ok("Date parses back to the right instant",
    hdr)
 
 section("reports tell the reader which clock they are on")
-rep = b.full_analytics({"model": "claude-opus-5", "allowlist": [],
+rep = b.full_analytics({"model": "claude-opus-5-5", "allowlist": [],
                         "file_allowlist": [], "spend": {}, "usage": {}})
 ok("system block states the clock", "Clock:" in rep and "UTC" in rep)
 ok("says daily limits roll over at 00:00 UTC", "00:00 UTC" in rep, )

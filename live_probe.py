@@ -58,19 +58,19 @@ def base(model, **kw):
 
 
 print("\n[1] web_search tool version vs model  (bot always sends _20260209)")
-for m in ("claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"):
+for m in ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"):
     call("%s + web_search_20260209" % m, base(m, tools=[WEB_NEW], max_tokens=256))
-call("claude-haiku-4-5 + web_search_20250305", base("claude-haiku-4-5",
+call("claude-haiku-5-5 + web_search_20250305", base("claude-haiku-5-5",
      tools=[WEB_OLD], max_tokens=256))
 
-print("\n[2] output_config.effort by model  (bot omits it only for haiku)")
-for m in ("claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"):
-    lvl = "max" if m == "claude-sonnet-5" else "xhigh"
+print("\n[2] output_config.effort by model  (bot sends it on every current model)")
+for m in ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"):
+    lvl = "max" if m == "claude-sonnet-5-5" else "xhigh"
     call("%s effort=%s" % (m, lvl), base(m, output_config={"effort": lvl},
                                          max_tokens=2000))
 
-print("\n[3] server-side fallbacks  (bot sends these on any opus-5 call)")
-call("opus-5 fallbacks=default", base("claude-opus-5", fallbacks="default",
+print("\n[3] server-side fallbacks  (bot sends these on any opus-5-5 call)")
+call("opus-5-5 fallbacks=default", base("claude-opus-5-5", fallbacks="default",
      max_tokens=256), betas=["server-side-fallback-2026-07-01"])
 
 TRIAGE_SYS = ('You triage email. Respond with ONLY JSON, no code fences: '
@@ -105,20 +105,21 @@ def triage(label, model, max_tokens, effort):
 
 
 print("\n[4] triage: the shape the bot ACTUALLY sends today")
-triage("sonnet-5 max_tokens=1500 effort=low  (live shape)",
-       "claude-sonnet-5", 1500, "low")
+triage("sonnet-5-5 max_tokens=1500 effort=low  (live shape)",
+       "claude-sonnet-5-5", 1500, "low")
 print("\n[4b] the same call starved of tokens, for contrast")
-triage("sonnet-5 max_tokens=500 effort=low", "claude-sonnet-5", 500, "low")
-triage("opus-5 max_tokens=500 effort=high  (the old shape)",
-       "claude-opus-5", 500, None)
+triage("sonnet-5-5 max_tokens=500 effort=low", "claude-sonnet-5-5", 500, "low")
+triage("opus-5-5 max_tokens=500 effort=high  (the old shape)",
+       "claude-opus-5-5", 500, None)
 
 print("\n[5] prompt caching, per model, at the bot's real prompt size")
 # The bot's non-admin system prompt is ~1161 tokens. The per-model cache
-# minimum decides whether cache_control does anything at all: Opus 5 needs
-# 512, Sonnet 5 needs 1024, Haiku 4.5 needs 4096. Below the minimum the API
-# accepts the request and silently ignores the caching - no error, no saving.
+# minimum decides whether cache_control does anything at all: Opus 5.5,
+# Sonnet 5.5 and Haiku 5.5 are all documented at 512 (Haiku 4.5 needed 4096,
+# which is why this probe exists). Below the minimum the API accepts the
+# request and silently ignores the caching - no error, no saving.
 SYS = ("You are Claude, an AI assistant answering emailed questions. " * 90)
-for model in ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"):
+for model in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"):
     for i in (1, 2):
         d = call("%s cached system prompt, request %d" % (model, i), {
             "model": model, "max_tokens": 32,
@@ -134,8 +135,8 @@ for model in ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"):
                      "CACHING" if (w or r) else "cache_control IGNORED"))
 
 print("\n[6] does web_search_20260209 actually RUN on haiku, or only validate?")
-for model, tool, name in (("claude-haiku-4-5", WEB_NEW, "_20260209"),
-                          ("claude-haiku-4-5", WEB_OLD, "_20250305")):
+for model, tool, name in (("claude-haiku-5-5", WEB_NEW, "_20260209"),
+                          ("claude-haiku-5-5", WEB_OLD, "_20250305")):
     d = call("%s %s, question that needs a search" % (model, name), {
         "model": model, "max_tokens": 1024, "tools": [tool],
         "system": "Use the web_search tool for anything time-sensitive.",
@@ -150,7 +151,7 @@ print()
 
 # --------------------------------------------------------------------------
 # Everything above reconstructs the bot's request shapes by hand, which is
-# exactly how a probe goes stale: it kept testing an opus-5 triage call two
+# exactly how a probe goes stale: it kept testing an opus-5-5 triage call two
 # commits after the bot stopped sending one. This section imports bot.py and
 # calls the real call_claude, so the payload under test is the one the bot
 # actually builds - tool version, effort, betas, cached system block and all.
@@ -205,17 +206,17 @@ def real(label, model, question, web_search, effort=None, max_tokens=400,
 # bot's own web_search_tool() picks it AND that the call goes through.
 LIVE_Q = "Who is the current Prime Minister of the United Kingdom?"
 
-real("trivial tier, no search (the default)", bot.TRIVIAL_MODEL or "claude-haiku-4-5",
+real("trivial tier, no search (the default)", bot.TRIVIAL_MODEL or "claude-haiku-5-5",
      "What is 2+2?", web_search=False)
 real("trivial tier WITH search (TRIVIAL_WEB_SEARCH=1)",
-     bot.TRIVIAL_MODEL or "claude-haiku-4-5", LIVE_Q,
+     bot.TRIVIAL_MODEL or "claude-haiku-5-5", LIVE_Q,
      web_search=True, must_search=True)
-real("main tier + search + effort", "claude-sonnet-5", LIVE_Q,
+real("main tier + search + effort", "claude-sonnet-5-5", LIVE_Q,
      web_search=True, effort="low", must_search=True)
-real("top tier + search + effort + fallbacks", "claude-opus-5", LIVE_Q,
+real("top tier + search + effort + fallbacks", "claude-opus-5-5", LIVE_Q,
      web_search=True, effort="low", must_search=True)
 # Second identical sonnet call: the system block is byte-identical, so this is
 # where a cache read should appear if caching is doing anything.
-real("sonnet again - cache read expected", "claude-sonnet-5", LIVE_Q,
+real("sonnet again - cache read expected", "claude-sonnet-5-5", LIVE_Q,
      web_search=True, effort="low", must_search=True)
 print()
